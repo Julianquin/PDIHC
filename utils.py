@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 # =====================
 #  Preparación de Datos
 # =====================
+
 def assign_data_sets(df, date_col, future_col, calib_ratio=0.6):
     """
     Asigna etiquetas de conjunto (TRAIN, CALIBRATION, TEST) a un DataFrame.
@@ -55,58 +56,165 @@ def split_data_by_set(group, set_col):
 # ==============================
 #  Cálculo de Intervalos - PDI
 # ==============================
+
 def quantile_integrator_log_scorecaster(
-    scores, alpha, lr, T_burnin, Csat, KI, ahead, seasonal_period, time_index, integrate=True, proportional_lr=True, scorecast=True
+    scores, 
+    alpha, 
+    lr, 
+    T_burnin, 
+    Csat, 
+    KI, 
+    ahead, 
+    seasonal_period, 
+    time_index, 
+    integrate=True, 
+    proportional_lr=True, 
+    scorecast=True
 ):
     """
     Calcula intervalos dinámicos de predicción utilizando PDI.
-    """
-    T_test = scores.shape[0]
-    qs = np.zeros((T_test,))
-    qts = np.zeros((T_test,))
-    integrators = np.zeros((T_test,))
-    scorecasts = np.zeros((T_test,))
-    covereds = np.zeros((T_test,))
 
+    Parámetros:
+    - scores (np.ndarray): Errores absolutos entre valores reales y predicciones.
+    - alpha (float): Nivel de significancia (1 - alpha es la cobertura deseada).
+    - lr (float): Tasa de aprendizaje para ajustar el término proporcional.
+    - T_burnin (int): Período de calentamiento antes de aplicar integral y derivativo.
+    - Csat (float): Constante de saturación para el término integral.
+    - KI (float): Escala del componente integral.
+    - ahead (int): Horizonte de predicción (pasos hacia el futuro).
+    - seasonal_period (int): Período de estacionalidad para el modelo derivativo.
+    - time_index (pd.DatetimeIndex): Índice temporal de los datos.
+    - integrate (bool): Si se debe aplicar el componente integral.
+    - proportional_lr (bool): Si se debe ajustar dinámicamente la tasa de aprendizaje.
+    - scorecast (bool): Si se debe incluir el componente derivativo.
+
+    Retorna:
+    - qs (np.ndarray): Intervalos ajustados dinámicamente.
+    """
+
+    T_test = scores.shape[0]  # Número total de pasos temporales
+    # Inicialización de variables
+    qs = np.zeros((T_test,))  # Cuantiles ajustados
+    qts = np.zeros((T_test,))  # Componente proporcional ajustado
+    integrators = np.zeros((T_test,))  # Componente integral ajustado
+    scorecasts = np.zeros((T_test,))  # Componente derivativo ajustado
+    covereds = np.zeros((T_test,))  # Indicador de cobertura
+
+    # Iterar a través de los pasos temporales
     for t in tqdm(range(T_test)):
-        t_pred = t - ahead + 1
+        t_pred = t - ahead + 1  # Tiempo de predicción actual
         if t_pred < 0:
-            continue
+            continue  # Saltar si no hay datos suficientes para predecir
+
+        # ================================
+        # Tasa de aprendizaje dinámica (P)
+        # ================================
         t_lr_min = max(t - T_burnin, 0)
         lr_t = lr * (scores[t_lr_min:t].max() - scores[t_lr_min:t].min()) if proportional_lr and t > 0 else lr
-        covereds[t] = qs[t] >= scores[t]
-        grad = alpha if covereds[t_pred] else -(1 - alpha)
+
+        # ======================================
+        # Componente Proporcional y Gradiente (P)
+        # ======================================
+        covereds[t] = qs[t] >= scores[t]  # Determinar si el cuantil cubre el error
+        grad = alpha if covereds[t_pred] else -(1 - alpha)  # Gradiente basado en cobertura
+
+        # ============================
+        # Componente Integral (I)
+        # ============================
         integrator_arg = (1 - covereds)[:t_pred].sum() - (t_pred) * alpha
-        integrator = np.tan(integrator_arg * np.log(t_pred + 1) / (Csat * (t_pred + 1))) if integrate else 0
+        integrator = (
+            np.tan(integrator_arg * np.log(t_pred + 1) / (Csat * (t_pred + 1))) if integrate else 0
+        )  # Corrección acumulativa
+
+        # ================================
+        # Componente Derivativo (D)
+        # ================================
         if scorecast and t_pred > T_burnin and t + ahead < T_test:
             score_series = pd.Series(scores[:t_pred], index=time_index[:t_pred])
-            model = ThetaModel(score_series, period=seasonal_period)
+            model = ThetaModel(score_series, period=seasonal_period)  # Modelo derivativo
             fitted_model = model.fit()
-            scorecasts[t + ahead] = fitted_model.forecast(ahead).iloc[-1]
+            scorecasts[t + ahead] = fitted_model.forecast(ahead).iloc[-1]  # Predicción futura del error
+
+        # ================================
+        # Actualización del Cuantil
+        # ================================
         if t < T_test - 1:
+            # Actualización del término proporcional
             qts[t + 1] = qts[t] - lr_t * grad
+            # Actualización del término integral
             integrators[t + 1] = integrator if integrate else 0
+            # Cálculo del cuantil ajustado
             qs[t + 1] = qts[t + 1] + integrators[t + 1]
             if scorecast:
-                qs[t + 1] += scorecasts[t + 1]
+                qs[t + 1] += scorecasts[t + 1]  # Agregar predicción futura
+
     return qs
 
+def apply_pdi_with_calibration(
+    df, 
+    key_col, 
+    date_col, 
+    value_col, 
+    pred_col, 
+    lower_col, 
+    upper_col, 
+    alpha, 
+    lr, 
+    T_burnin, 
+    Csat, 
+    KI, 
+    ahead, 
+    seasonal_period, 
+    set_col
+):
+    """
+    Aplica el método PDI con calibración a un DataFrame que contiene múltiples series.
 
-def apply_pdi_with_calibration(df, key_col, date_col, value_col, pred_col, lower_col, upper_col,
-                               alpha, lr, T_burnin, Csat, KI, ahead, seasonal_period, set_col):
+    Esta función genera intervalos dinámicos de predicción (PDI) para cada serie identificada por `key_col`.
+    Se utilizan conjuntos de datos separados en entrenamiento (TRAIN), calibración (CALIBRATION), 
+    y prueba (TEST) según lo indicado en la columna `set_col`.
+
+    Parámetros:
+    - df (pd.DataFrame): DataFrame que contiene los datos.
+    - key_col (str): Columna que identifica las diferentes series.
+    - date_col (str): Columna que contiene las fechas.
+    - value_col (str): Columna con los valores reales.
+    - pred_col (str): Columna con las predicciones.
+    - lower_col (str): Nombre de la columna donde se guardará el límite inferior del intervalo.
+    - upper_col (str): Nombre de la columna donde se guardará el límite superior del intervalo.
+    - alpha (float): Nivel de significancia (1 - alpha es la cobertura deseada).
+    - lr (float): Tasa de aprendizaje para ajustar el término proporcional.
+    - T_burnin (int): Período de calentamiento antes de aplicar integral y derivativo.
+    - Csat (float): Constante de saturación para el término integral.
+    - KI (float): Escala del componente integral.
+    - ahead (int): Horizonte de predicción (pasos hacia el futuro).
+    - seasonal_period (int): Período de estacionalidad para el modelo derivativo.
+    - set_col (str): Columna que indica el conjunto al que pertenece cada dato (TRAIN, CALIBRATION, TEST).
+
+    Retorna:
+    - pd.DataFrame: DataFrame con los intervalos de predicción (`lower_col`, `upper_col`) generados.
+
     """
-    Aplica PDI a cada serie en el DataFrame.
-    """
+    # Lista para almacenar los resultados procesados por serie
     results = []
+
+    # Iterar por cada serie identificada por key_col
     for key, group in df.groupby(key_col):
+        # Ordenar los datos por la columna de fechas
         group = group.sort_values(by=date_col)
+
+        # Dividir los datos en conjuntos de entrenamiento, calibración y prueba
         train, calib, test = split_data_by_set(group, set_col=set_col)
 
-        y_train = train[value_col].dropna().values
-        y_pred_train = train[pred_col].dropna().values
-        scores_train = np.abs(y_train - y_pred_train)
-        time_index_train = pd.to_datetime(train[date_col])
+        # ==============================
+        # Datos de Entrenamiento
+        # ==============================
+        y_train = train[value_col].dropna().values  # Valores reales
+        y_pred_train = train[pred_col].dropna().values  # Predicciones
+        scores_train = np.abs(y_train - y_pred_train)  # Cálculo de errores absolutos
+        time_index_train = pd.to_datetime(train[date_col])  # Índice temporal para entrenamiento
 
+        # Calcular intervalos para datos de entrenamiento usando PDI
         qs_calib = quantile_integrator_log_scorecaster(
             scores=scores_train,
             alpha=alpha,
@@ -123,22 +231,27 @@ def apply_pdi_with_calibration(df, key_col, date_col, value_col, pred_col, lower
         train[lower_col] = train[pred_col] - qs_calib
         train[upper_col] = train[pred_col] + qs_calib
 
-        # Generar intervalos para calibración y prueba
-        last_calib_quantile = qs_calib[-1]
+        # ==============================
+        # Datos de Calibración y Prueba
+        # ==============================
+        last_calib_quantile = qs_calib[-1]  # Último cuantil ajustado del entrenamiento
+        # Calibración
         calib[lower_col] = calib[pred_col] - last_calib_quantile
         calib[upper_col] = calib[pred_col] + last_calib_quantile
+        # Prueba
         test[lower_col] = test[pred_col] - last_calib_quantile
         test[upper_col] = test[pred_col] + last_calib_quantile
 
-
+        # Agregar los conjuntos procesados a la lista de resultados
         results.append(pd.concat([train, calib, test]))
 
+    # Combinar los resultados procesados para todas las series
     return pd.concat(results)
-
 
 # =========================
 #  Evaluación de Resultados
 # =========================
+
 def calculate_metrics(df, value_col, lower_col, upper_col, condition_col=None):
     """
     Calcula Marginal Coverage, Average Region Size y Conditional Coverage.
@@ -178,10 +291,10 @@ def calculate_metrics(df, value_col, lower_col, upper_col, condition_col=None):
 
     return metrics
 
-
 # ====================
 #  Visualización
 # ====================
+
 def plot_series_results_with_sets(
     df, key, key_col="KEY", date_col="FECHA", value_col="Y",
     pred_col="YHATFIN", lower_col="YHAT_L", upper_col="YHAT_U", set_col="SET"
