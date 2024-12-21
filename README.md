@@ -1,93 +1,132 @@
-# PDIHC
-PDI Haute Couture
+# PDIHC - PDI Haute Couture
 
-### **1. Objetivo**
-Discutir y entender la implementación del método **PDI (Proportional-Integral-Derivative)** para generar intervalos de predicción dinámicos en series temporales. Además, adaptar este método para trabajar con un `DataFrame` que contiene múltiples series identificadas por una clave (`KEY`), incluyendo la consideración de datos futuros sin valores reales.
 
----
+## **1. Objetivo**
 
-### **2. Desarrollo**
+Este proyecto tiene como objetivo principal implementar, adaptar y evaluar el método **PDI (Proportional-Integral-Derivative)** para generar intervalos de predicción dinámicos en series temporales. El método está diseñado para cumplir con una cobertura específica $1-\alpha$, ajustándose en línea con base en tres componentes principales: proporcional, integral y derivativo.
 
-#### **A. Implementación Inicial de PDI**
-- Implementamos el método `quantile_integrator_log_scorecaster`, el cual:
-  - Ajusta los intervalos dinámicamente en función de tres componentes:
-    - **Proporcional (P)**: Ajusta el intervalo con base en el error reciente.
-    - **Integral (I)**: Corrige desviaciones acumulativas de cobertura.
-    - **Derivativo (D)**: Anticipa cambios futuros usando un modelo `ThetaModel`.
-  - Considera parámetros clave como la tasa de aprendizaje dinámica (`lr`), el período de calentamiento (`T_burnin`), y el horizonte de predicción (`ahead`).
+Además, se busca integrar este enfoque en un marco práctico que permita:
+- Trabajar con un `DataFrame` que contenga múltiples series temporales identificadas por una clave (`KEY`).
+- Diferenciar entre datos históricos y futuros, generando intervalos para ambos escenarios.
+- Implementar técnicas de evaluación para garantizar la cobertura y estabilidad de los intervalos generados.
 
-#### **B. Problema Inicial**
-- Los datos históricos se procesaron correctamente, pero no se generaban intervalos para datos futuros donde no existían valores reales (`Y`), identificados con la columna `FUTURE`.
 
-#### **C. Modificaciones al Método**
-1. **Incorporación de Datos Futuros**:
-   - Se ajustó el método para diferenciar datos históricos y futuros usando la columna `FUTURE`.
-   - Para datos futuros:
-     - Se utilizó el último intervalo ajustado como base.
-     - Se agregó un componente derivativo predicho usando `ThetaModel`.
+## **2. Desarrollo**
 
-2. **Manejo de Casos Extremos**:
-   - Se añadió una validación para manejar casos donde los datos históricos sean insuficientes o faltantes.
-   - En estos casos, se usa la media de los errores históricos para estimar intervalos futuros.
+### **A. Preparación de Datos**
+1. **Separación en Conjuntos**:
+   - Se implementó la función `assign_data_sets` para dividir las series en tres conjuntos:
+     - **TRAIN**: Conjunto de entrenamiento, utilizado para ajustar los intervalos dinámicos.
+     - **CALIBRATION**: Conjunto de calibración, utilizado para validar y estabilizar los intervalos ajustados.
+     - **TEST**: Conjunto de prueba, destinado a datos futuros donde no se tienen valores reales (`Y`).
 
-3. **Validaciones de Índices y Máscaras**:
-   - Se corrigieron problemas relacionados con el desajuste entre índices y máscaras booleanas (`is_future`).
+   - La asignación respeta las siguientes reglas:
+     - Datos con `FUTURE = 1` pertenecen al conjunto de prueba (`TEST`).
+     - Datos con `FUTURE = 0` se dividen en TRAIN y CALIBRATION según un porcentaje configurable (`calib_ratio`).
 
-#### **D. Función Final**
-La función final implementada fue `apply_pdi_to_dataframe_with_future`, la cual:
-- Recibe un `DataFrame` con múltiples series (`KEY`), valores históricos (`Y`), predicciones (`YHATFIN`), y un indicador de futuro (`FUTURE`).
-- Genera bandas de predicción ajustadas (`YHAT_L` y `YHAT_U`) tanto para datos históricos como futuros.
+2. **Función `split_data_by_set`**:
+   - Permite dividir los datos de una serie específica en los conjuntos mencionados anteriormente.
 
-#### **E. Resultados**
+### **B. Implementación del Método PDI**
+
+#### **1. Método Principal: `quantile_integrator_log_scorecaster`**
+- Este método ajusta los intervalos dinámicamente utilizando los tres componentes PID:
+  - **Proporcional (P)**:
+    - Ajusta el intervalo en función del error reciente.
+    - Utiliza la tasa de aprendizaje dinámica `lr_t` calculada según la variación reciente en los errores.
+  - **Integral (I)**:
+    - Corrige desviaciones acumulativas en la cobertura observada respecto a la deseada.
+    - Implementa un integrador no lineal basado en la función tangente.
+  - **Derivativo (D)**:
+    - Anticipa cambios futuros en los errores utilizando el modelo `ThetaModel`.
+
+#### **2. Aplicación del Método a Datos Reales**
+- La función `apply_pdi_with_calibration` adapta el método PDI a un `DataFrame` que contiene múltiples series.
+  - Para cada serie:
+    - Ajusta los intervalos dinámicamente en el conjunto de entrenamiento (`TRAIN`).
+    - Genera intervalos consistentes para los conjuntos de calibración (`CALIBRATION`) y prueba (`TEST`).
+  - Los intervalos generados para calibración y prueba se basan en el último cuantil ajustado en el conjunto de entrenamiento.
+
+### **C. Evaluación de Resultados**
+
+#### **1. Métricas Calculadas**
+- **Cobertura Marginal (`Marginal Coverage`)**:
+  - Porcentaje de valores reales que caen dentro del intervalo de predicción.
+- **Tamaño Promedio del Intervalo (`Average Region Size`)**:
+  - Longitud promedio de los intervalos generados.
+- **Cobertura Condicional (`Conditional Coverage`)**:
+  - Cobertura evaluada para cada serie (`KEY`).
+
+#### **2. Función de Evaluación: `calculate_metrics`**
+- Centraliza el cálculo de las tres métricas mencionadas.
+- Permite calcular métricas globales (a nivel del DataFrame) o por serie (a nivel de `KEY`).
+
+#### **3. Visualización de Resultados**
+- La función `plot_series_results_with_sets` genera gráficos individuales para cada serie, mostrando:
+  - Valores reales y predicciones.
+  - Intervalos de predicción generados.
+  - Periodos marcados para los conjuntos TRAIN, CALIBRATION y TEST.
+
+
+
+## **3. Código Final**
+
+### **A. Preparación de Datos**
+- `assign_data_sets`: Asigna etiquetas de conjunto (TRAIN, CALIBRATION, TEST).
+- `split_data_by_set`: Divide un grupo en los conjuntos mencionados.
+
+### **B. Cálculo de Intervalos**
+- `quantile_integrator_log_scorecaster`: Implementa el método PDI para ajustar intervalos dinámicos.
+- `apply_pdi_with_calibration`: Aplica PDI a un DataFrame con múltiples series.
+
+### **C. Evaluación y Visualización**
+- `calculate_metrics`: Calcula métricas de evaluación (Marginal Coverage, Average Region Size, Conditional Coverage).
+- `plot_series_results_with_sets`: Visualiza resultados individuales por serie.
+
+
+## **4. Parámetros del Modelo**
+
+Los parámetros principales del modelo PDI incluyen:
+
+1. **Cobertura y Aprendizaje**:
+   - `alpha`: Nivel de significancia deseado, que determina la cobertura esperada ($1 - \alpha$).
+   - `lr`: Tasa de aprendizaje para ajustar dinámicamente la componente proporcional.
+
+2. **Estabilidad y Predicción**:
+   - `T_burnin`: Período inicial para estabilizar el modelo antes de aplicar componentes integral o derivativo.
+   - `Csat`: Constante de saturación para evitar ajustes excesivos en la componente integral.
+   - `KI`: Escala del componente integral.
+   - `ahead`: Horizonte de predicción (número de pasos futuros a predecir).
+   - `seasonal_period`: Período de estacionalidad para ajustar predicciones con el modelo `ThetaModel`.
+
+3. **División de Datos**:
+   - `calib_ratio`: Proporción de datos históricos asignados al conjunto de calibración.
+
+
+## **5. Resultados Actuales**
+
 1. **Cálculo de Intervalos**:
-   - Se logró calcular intervalos dinámicos de predicción para cada serie y cada período, respetando las especificaciones de PDI.
+   - Intervalos dinámicos generados consistentemente para datos históricos y futuros.
+   - Integración completa de los componentes PID (Proporcional, Integral y Derivativo).
 
-2. **Visualización**:
-   - Se discutieron opciones para visualizar los resultados, incluyendo el uso de `Plotly` para una representación interactiva de los intervalos.
+2. **Evaluación**:
+   - Métricas calculadas para cada serie:
+     - Cobertura Marginal
+     - Tamaño Promedio del Intervalo
+     - Cobertura Condicional
 
----
+3. **Visualización**:
+   - Gráficos que destacan los conjuntos TRAIN, CALIBRATION y TEST, mostrando la alineación con los valores reales y predicciones.
 
-### **3. Parámetros del Modelo**
-Los parámetros clave del modelo PDI fueron discutidos y explicados detalladamente:
 
-- **`alpha`**: Nivel de significancia (determina la cobertura deseada del intervalo).
-- **`lr`**: Tasa de aprendizaje para ajustar la componente proporcional.
-- **`T_burnin`**: Período inicial donde no se aplica ajuste integral ni derivativo.
-- **`Csat`**: Controla la saturación del componente integral para evitar explosiones en el ajuste.
-- **`KI`**: Escala del componente integral.
-- **`ahead`**: Horizonte de predicción.
-- **`seasonal_period`**: Período de estacionalidad para desestacionalizar datos en el modelo derivativo.
-
----
-
-### **4. Código Final**
-
-#### **Método PDI:**
-El método `quantile_integrator_log_scorecaster` ajusta los intervalos dinámicamente según la formulación PID descrita.
-
-#### **Aplicación del Método:**
-La función `apply_pdi_to_dataframe_with_future` adapta PDI a un `DataFrame` con múltiples series y datos futuros.
-
----
-
-### **5. Principales Problemas Resueltos**
-1. **Errores en el Índice Temporal (`time_index`)**:
-   - Se corrigió la alineación entre los datos históricos y los índices temporales.
-2. **Incorporación de Datos Futuros**:
-   - Ahora se generan intervalos consistentes para predicciones futuras.
-3. **Problemas con la Máscara `is_future`**:
-   - Se validaron los tipos y la alineación de las máscaras booleanas.
-
----
-
-### **6. Próximos Pasos**
+## **6. Próximos Pasos**
 1. **Optimización del Código**:
-   - Revisar la eficiencia en el cálculo de intervalos para grandes volúmenes de datos.
-2. **Validación Adicional**:
-   - Evaluar la cobertura y el rendimiento de los intervalos ajustados en datos reales.
-3. **Extensión del Modelo**:
-   - Considerar incluir variables exógenas en el modelo derivativo.
+   - Revisar la eficiencia en la generación de intervalos para grandes volúmenes de datos.
+   - Paralelización para múltiples series.
 
----
+2. **Extensión del Modelo**:
+   - Incorporar variables exógenas en el modelo derivativo.
+   - Experimentar con otros métodos de scorecasting.
 
-Este resumen cubre los aspectos clave de la implementación, los problemas encontrados y las soluciones aplicadas. Si necesitas más detalles en algún punto específico, ¡házmelo saber! 🚀
+3. **Validación Adicional**:
+   - Evaluar el rendimiento en datos reales y comparar con enfoques alternativos.
