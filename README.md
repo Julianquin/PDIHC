@@ -130,3 +130,8 @@ Los parámetros principales del modelo PDI incluyen:
 
 3. **Validación Adicional**:
    - Evaluar el rendimiento en datos reales y comparar con enfoques alternativos.
+
+
+
+
+PLOTEAR $q_{t}$ de los scores

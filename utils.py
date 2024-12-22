@@ -188,6 +188,23 @@ def quantile_integrator_log_scorecaster(
 
     return qs
 
+def mytan(x):
+    if x >= np.pi/2:
+        return np.infty
+    elif x <= -np.pi/2:
+        return -np.infty
+    else:
+        return np.tan(x)
+
+def saturation_fn_log(x, t, Csat, KI):
+    if KI == 0:
+        return 0
+    tan_out = mytan(x * np.log(t+1)/(Csat * (t+1)))
+    out = KI * tan_out
+    return  out
+
+def saturation_fn_sqrt(x, t, Csat, KI):
+    return KI * mytan((x * np.sqrt(t+1))/((Csat * (t+1))))
 
 def quantile_integrator_log_scorecaster_with_diagnostics(
     scores, 
@@ -244,9 +261,8 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         # Componente Integral (I)
         # ============================
         integrator_arg = (1 - covereds)[:t_pred].sum() - (t_pred) * alpha
-        integrator = (
-            np.tan(integrator_arg * np.log(t_pred + 1) / (Csat * (t_pred + 1))) if integrate else 0
-        )
+        # integrator = (np.tan(integrator_arg * np.log(t_pred + 1) / (Csat * (t_pred + 1))) if integrate else 0 )
+        integrator = saturation_fn_log(integrator_arg, t_pred, Csat, KI)
         integrators[t] = integrator
         logs["integral"].append(integrator)
 
@@ -272,6 +288,7 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         # ================================
         if t < T_test - 1:
             qts[t + 1] = qts[t] + proportional_update
+            
             integrators[t + 1] = integrator if integrate else 0
             qs[t + 1] = qts[t + 1] + integrators[t + 1]
             if scorecast:
