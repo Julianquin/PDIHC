@@ -3,15 +3,19 @@ import pandas as pd
 from tqdm import tqdm
 from statsmodels.tsa.forecasting.theta import ThetaModel
 import matplotlib.pyplot as plt
+import os
+import pickle
+
 
 # =====================
 #  Baseline Methods
 # =====================
 
+
 def trailing_window(
     scores,
     alpha,
-    lr, # Dummy argument
+    lr,  # Argumento dummy
     weight_length,
     ahead,
     *args,
@@ -21,11 +25,11 @@ def trailing_window(
     qs = np.zeros((T_test,))
     for t in tqdm(range(T_test)):
         t_pred = t - ahead + 1
-        if min(weight_length, t_pred) < np.ceil(1/alpha):
-            qs[t] = np.infty
+        if min(weight_length, t_pred) < np.ceil(1 / alpha):
+            qs[t] = np.inf  # Cambiar np.infty por np.inf
         else:
-            qs[t] = np.quantile(scores[max(t_pred-weight_length,0):t_pred], 1-alpha, method='higher')
-    results = {"method": "Trail", "q" : qs}
+            qs[t] = np.quantile(scores[max(t_pred - weight_length, 0):t_pred], 1 - alpha, method='higher')
+    results = {"method": "Trail", "q": qs}
     return results
 
 def aci_clipped(
@@ -45,11 +49,11 @@ def aci_clipped(
     covereds = np.zeros((T_test,))
     for t in tqdm(range(T_test)):
         t_pred = t - ahead + 1
-        clip_value = scores[max(t_pred-window_length,0):t_pred].max() if t_pred > 0 else np.infty
+        clip_value = scores[max(t_pred-window_length,0):t_pred].max() if t_pred > 0 else np.inf
         if t_pred > T_burnin:
             # Setup: current gradient
             if alphat <= 1/(t_pred+1):
-                qs[t] = np.infty
+                qs[t] = np.inf
             else:
                 qs[t] = np.quantile(scores[max(t_pred-window_length,0):t_pred], 1-np.clip(alphat, 0, 1), method='higher')
             covereds[t] = qs[t] >= scores[t]
@@ -62,8 +66,8 @@ def aci_clipped(
             if t_pred > np.ceil(1/alpha):
                 qs[t] = np.quantile(scores[:t_pred], 1-alpha)
             else:
-                qs[t] = np.infty
-        if qs[t] == np.infty:
+                qs[t] = np.inf
+        if qs[t] == np.inf:
             qs[t] = clip_value
     results = { "method": "ACI (clipped)", "q" : qs, "alpha" : alphas}
     return results
@@ -88,7 +92,7 @@ def aci(
         if t_pred > T_burnin:
             # Setup: current gradient
             if alphat <= 1/(t_pred+1):
-                qs[t] = np.infty
+                qs[t] = np.inf
             else:
                 qs[t] = np.quantile(scores[max(t_pred-window_length,0):t_pred], 1-np.clip(alphat, 0, 1), method='higher')
             covereds[t] = qs[t] >= scores[t]
@@ -101,7 +105,7 @@ def aci(
             if t_pred > np.ceil(1/alpha):
                 qs[t] = np.quantile(scores[:t_pred], 1-alpha)
             else:
-                qs[t] = np.infty
+                qs[t] = np.inf
     results = { "method": "ACI", "q" : qs, "alpha" : alphas}
     return results
 
@@ -190,6 +194,21 @@ def split_data_by_set(group, set_col):
     test = group[group[set_col] == "TEST"]
     return train, calib, test
 
+def save_model(model, filename):
+    """
+    Guarda un modelo entrenado en un archivo.
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, 'wb') as f:
+        pickle.dump(model, f)
+
+def load_model(filename):
+    """
+    Carga un modelo previamente entrenado desde un archivo.
+    """
+    with open(filename, 'rb') as f:
+        return pickle.load(f)
+
 # ==============================
 #  Cálculo de Intervalos - PDI
 # ==============================
@@ -267,11 +286,12 @@ def quantile_integrator_log_scorecaster(
         # Componente Derivativo (D)
         # ================================
         if scorecast and t_pred > T_burnin and t + ahead < T_test:
+            
             score_series = pd.Series(scores[:t_pred], index=time_index[:t_pred])
             model = ThetaModel(score_series, period=seasonal_period)  # Modelo derivativo
             fitted_model = model.fit()
             scorecasts[t + ahead] = fitted_model.forecast(ahead).iloc[-1]  # Predicción futura del error
-
+            
         # ================================
         # Actualización del Cuantil
         # ================================
@@ -289,9 +309,9 @@ def quantile_integrator_log_scorecaster(
 
 def mytan(x):
     if x >= np.pi/2:
-        return np.infty
+        return np.inf
     elif x <= -np.pi/2:
-        return -np.infty
+        return -np.inf
     else:
         return np.tan(x)
 
@@ -346,8 +366,49 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         # Tasa de aprendizaje dinámica (P)
         # ================================
         t_lr_min = max(t - T_burnin, 0)
-        lr_t = lr * (scores[t_lr_min:t].max() - scores[t_lr_min:t].min()) if proportional_lr and t > 0 else lr
-        # lr_t = lr
+        # lr_t = lr * (scores[t_lr_min:t].max() - scores[t_lr_min:t].min()) if proportional_lr and t > 0 else lr
+        
+        if t == 0 or len(scores[t_lr_min:t]) == 0:
+            lr_t = lr  # Usa la tasa de aprendizaje base para el primer paso
+ 
+        else:
+            range_scores = scores[t_lr_min:t].max() - scores[t_lr_min:t].min()
+
+            # Opcion 1: Paper
+            lr_t = lr * (scores[t_lr_min:t].max() - scores[t_lr_min:t].min()) if proportional_lr and t > 0 else lr
+            
+            # Opcion 1: Rango simple
+            lr_t = lr * range_scores
+            
+            # Opcion 2: Suavizado del rango
+            smoothed_range = pd.Series([range_scores]).rolling(window=3, min_periods=1).mean().iloc[-1]
+            lr_t = lr * smoothed_range
+
+            # Opcion 3 Escalado dinámico con límites (EXPLOTÓ!)
+            lr_min_dynamic = 0.01 * lr  # Escalado mínimo basado en la tasa de aprendizaje base
+            lr_max_dynamic = lr * (1 + range_scores / (np.std(scores[t_lr_min:t]) + 1e-8))  # Escalado dinámico máximo
+            lr_t = np.clip(lr_t, lr_min_dynamic, lr_max_dynamic)
+
+            # Opcion 4: IQR
+            if len(scores[t_lr_min:t]) >= 2:  # Asegura que hay suficientes datos para calcular percentiles
+                iqr_scores = np.percentile(scores[t_lr_min:t], 90) - np.percentile(scores[t_lr_min:t], 10)
+                lr_t = lr * iqr_scores
+            else:
+                lr_t = lr  # Fallback al valor base
+            
+            # Opcion 5: Historial del gradiente
+            # grad_history = np.cumsum([alpha if covered else -(1 - alpha) for covered in covereds[t_lr_min:t]])
+            # if len(grad_history) > 0:  # Asegúrate de que el historial no esté vacío
+            #    lr_t = lr * range_scores / (1 + np.abs(grad_history[-1]))
+            #else:
+            #    lr_t = lr  # Fallback al valor base
+
+            # Opcion 6: Escalado con raíz cuadrada del tiempo
+            # scaling_factor = np.sqrt(t + 1)
+            # lr_t = lr * range_scores / scaling_factor
+
+
+
         # ======================================
         # Componente Proporcional y Gradiente (P)
         # ======================================
@@ -369,9 +430,12 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         # Componente Derivativo (D)
         # ================================
         if scorecast and t_pred > T_burnin and t + ahead < T_test:
+            model_filename = f"./model_cache/scorecaster_{t_pred}.pkl"
+            
             score_series = pd.Series(scores[:t_pred], index=time_index[:t_pred])
             model = ThetaModel(score_series, period=seasonal_period)
             fitted_model = model.fit()
+            # save_model(fitted_model, model_filename)
             scorecasts[t + ahead] = fitted_model.forecast(ahead).iloc[-1]
         logs["derivative"].append(scorecasts[t])
 
@@ -394,7 +458,6 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
                 qs[t + 1] += scorecasts[t + 1]
 
     return qs, logs
-
 
 def apply_pdi_with_calibration(
     df, 
@@ -493,7 +556,6 @@ def apply_pdi_with_calibration(
 
     # Combinar los resultados procesados para todas las series
     return pd.concat(results)
-
 
 def apply_pdi_with_calibration_with_diagnostics(
     df, 
