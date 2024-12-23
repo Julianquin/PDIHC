@@ -194,118 +194,10 @@ def split_data_by_set(group, set_col):
     test = group[group[set_col] == "TEST"]
     return train, calib, test
 
-def save_model(model, filename):
-    """
-    Guarda un modelo entrenado en un archivo.
-    """
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    with open(filename, 'wb') as f:
-        pickle.dump(model, f)
-
-def load_model(filename):
-    """
-    Carga un modelo previamente entrenado desde un archivo.
-    """
-    with open(filename, 'rb') as f:
-        return pickle.load(f)
 
 # ==============================
-#  Cálculo de Intervalos - PDI
+#  Funciones Auxiliares - PDI
 # ==============================
-
-def quantile_integrator_log_scorecaster(
-    scores, 
-    alpha, 
-    lr, 
-    T_burnin, 
-    Csat, 
-    KI, 
-    ahead, 
-    seasonal_period, 
-    time_index, 
-    integrate=True, 
-    proportional_lr=True, 
-    scorecast=True
-):
-    """
-    Calcula intervalos dinámicos de predicción utilizando PDI.
-
-    Parámetros:
-    - scores (np.ndarray): Errores absolutos entre valores reales y predicciones.
-    - alpha (float): Nivel de significancia (1 - alpha es la cobertura deseada).
-    - lr (float): Tasa de aprendizaje para ajustar el término proporcional.
-    - T_burnin (int): Período de calentamiento antes de aplicar integral y derivativo.
-    - Csat (float): Constante de saturación para el término integral.
-    - KI (float): Escala del componente integral.
-    - ahead (int): Horizonte de predicción (pasos hacia el futuro).
-    - seasonal_period (int): Período de estacionalidad para el modelo derivativo.
-    - time_index (pd.DatetimeIndex): Índice temporal de los datos.
-    - integrate (bool): Si se debe aplicar el componente integral.
-    - proportional_lr (bool): Si se debe ajustar dinámicamente la tasa de aprendizaje.
-    - scorecast (bool): Si se debe incluir el componente derivativo.
-
-    Retorna:
-    - qs (np.ndarray): Intervalos ajustados dinámicamente.
-    """
-
-    T_test = scores.shape[0]  # Número total de pasos temporales
-    # Inicialización de variables
-    qs = np.zeros((T_test,))  # Cuantiles ajustados
-    qts = np.zeros((T_test,))  # Componente proporcional ajustado
-    integrators = np.zeros((T_test,))  # Componente integral ajustado
-    scorecasts = np.zeros((T_test,))  # Componente derivativo ajustado
-    covereds = np.zeros((T_test,))  # Indicador de cobertura
-
-    # Iterar a través de los pasos temporales
-    for t in tqdm(range(T_test)):
-        t_pred = t - ahead + 1  # Tiempo de predicción actual
-        if t_pred < 0:
-            continue  # Saltar si no hay datos suficientes para predecir
-
-        # ================================
-        # Tasa de aprendizaje dinámica (P)
-        # ================================
-        t_lr_min = max(t - T_burnin, 0)
-        lr_t = lr * (scores[t_lr_min:t].max() - scores[t_lr_min:t].min()) if proportional_lr and t > 0 else lr
-
-        # ======================================
-        # Componente Proporcional y Gradiente (P)
-        # ======================================
-        covereds[t] = qs[t] >= scores[t]  # Determinar si el cuantil cubre el error
-        grad = alpha if covereds[t_pred] else -(1 - alpha)  # Gradiente basado en cobertura
-
-        # ============================
-        # Componente Integral (I)
-        # ============================
-        integrator_arg = (1 - covereds)[:t_pred].sum() - (t_pred) * alpha
-        integrator = (
-            np.tan(integrator_arg * np.log(t_pred + 1) / (Csat * (t_pred + 1))) if integrate else 0
-        )  # Corrección acumulativa
-
-        # ================================
-        # Componente Derivativo (D)
-        # ================================
-        if scorecast and t_pred > T_burnin and t + ahead < T_test:
-            
-            score_series = pd.Series(scores[:t_pred], index=time_index[:t_pred])
-            model = ThetaModel(score_series, period=seasonal_period)  # Modelo derivativo
-            fitted_model = model.fit()
-            scorecasts[t + ahead] = fitted_model.forecast(ahead).iloc[-1]  # Predicción futura del error
-            
-        # ================================
-        # Actualización del Cuantil
-        # ================================
-        if t < T_test - 1:
-            # Actualización del término proporcional
-            qts[t + 1] = qts[t] - lr_t * grad
-            # Actualización del término integral
-            integrators[t + 1] = integrator if integrate else 0
-            # Cálculo del cuantil ajustado
-            qs[t + 1] = qts[t + 1] + integrators[t + 1]
-            if scorecast:
-                qs[t + 1] += scorecasts[t + 1]  # Agregar predicción futura
-
-    return qs
 
 def mytan(x):
     if x >= np.pi/2:
@@ -325,6 +217,78 @@ def saturation_fn_log(x, t, Csat, KI):
 def saturation_fn_sqrt(x, t, Csat, KI):
     return KI * mytan((x * np.sqrt(t+1))/((Csat * (t+1))))
 
+def calculate_dynamic_learning_rate(
+    scores, 
+    t_lr_min, 
+    t, 
+    lr, 
+    proportional_lr, 
+    alpha, 
+    covereds, 
+    option
+):
+    """
+    Calcula la tasa de aprendizaje dinámica basada en varias opciones.
+
+    Parámetros:
+    - scores (np.ndarray): Errores absolutos.
+    - t_lr_min (int): Índice mínimo para el cálculo de `lr_t`.
+    - t (int): Índice actual.
+    - lr (float): Tasa de aprendizaje base.
+    - proportional_lr (bool): Si se usa un escalado proporcional.
+    - alpha (float): Nivel de significancia.
+    - covereds (np.ndarray): Indicadores de cobertura.
+    - option (str): Método de cálculo ('proportional_range', 'simple', 'smoothed', 'iqr', etc.).
+
+    Retorna:
+    - lr_t (float): Tasa de aprendizaje dinámica.
+    """
+    if t == 0 or len(scores[t_lr_min:t]) == 0:
+        return lr
+
+    range_scores = scores[t_lr_min:t].max() - scores[t_lr_min:t].min()
+
+    if option == "proportional_range":
+        return lr * range_scores if proportional_lr else lr
+    
+    elif option == "simple":
+        return lr * range_scores
+    
+    elif option == "smoothed":
+        smoothed_range = pd.Series([range_scores]).rolling(window=3, min_periods=1).mean().iloc[-1]
+        return lr * smoothed_range
+    
+    elif option == "dynamic_limited":
+        if len(scores[t_lr_min:t]) >= 2:  # Asegura suficientes datos para cálculos
+            std_dev = np.std(scores[t_lr_min:t]) + 1e-8  # Evita división por cero
+            lr_min_dynamic = 0.01 * lr  # Escalado mínimo fijo
+            lr_max_dynamic = lr * (1 + range_scores / std_dev)  # Escalado dinámico máximo
+            return np.clip(lr * range_scores, lr_min_dynamic, lr_max_dynamic)
+        else:
+            return lr  
+
+    elif option == "iqr":
+        if len(scores[t_lr_min:t]) >= 2:
+            iqr_scores = np.percentile(scores[t_lr_min:t], 75) - np.percentile(scores[t_lr_min:t], 25)
+            return lr * iqr_scores
+        else:
+            return lr
+    
+    elif option == "gradient_history":
+        grad_history = np.cumsum([alpha if covered else -(1 - alpha) for covered in covereds[t_lr_min:t]])
+        return lr * range_scores / (1 + np.abs(grad_history[-1])) if len(grad_history) > 0 else lr
+    
+    elif option == "scaling_factor":
+        scaling_factor = np.sqrt(t + 1)
+        return lr * range_scores / scaling_factor
+    else:
+        raise ValueError(f"Opción desconocida para la tasa de aprendizaje: {option}")
+
+
+# ==============================
+#  Cálculo de Intervalos - PDI
+# ==============================
+
 def quantile_integrator_log_scorecaster_with_diagnostics(
     scores, 
     alpha, 
@@ -338,7 +302,8 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
     integrate=True, 
     proportional_lr=True, 
     scorecast=True,
-    coverage_threshold=0.9  # Umbral para alertar cobertura baja
+    coverage_threshold=0.9,  # Umbral para alertar cobertura baja
+    lr_option="proportional_range"
 ):
     """
     Calcula intervalos dinámicos de predicción con diagnóstico detallado.
@@ -363,50 +328,19 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
             continue
 
         # ================================
-        # Tasa de aprendizaje dinámica (P)
+        # Tasa de aprendizaje dinámica (P)  
         # ================================
         t_lr_min = max(t - T_burnin, 0)
-        # lr_t = lr * (scores[t_lr_min:t].max() - scores[t_lr_min:t].min()) if proportional_lr and t > 0 else lr
-        
-        if t == 0 or len(scores[t_lr_min:t]) == 0:
-            lr_t = lr  # Usa la tasa de aprendizaje base para el primer paso
- 
-        else:
-            range_scores = scores[t_lr_min:t].max() - scores[t_lr_min:t].min()
-
-            # Opcion 1: Paper
-            lr_t = lr * (scores[t_lr_min:t].max() - scores[t_lr_min:t].min()) if proportional_lr and t > 0 else lr
-            
-            # Opcion 1: Rango simple
-            lr_t = lr * range_scores
-            
-            # Opcion 2: Suavizado del rango
-            smoothed_range = pd.Series([range_scores]).rolling(window=3, min_periods=1).mean().iloc[-1]
-            lr_t = lr * smoothed_range
-
-            # Opcion 3 Escalado dinámico con límites (EXPLOTÓ!)
-            lr_min_dynamic = 0.01 * lr  # Escalado mínimo basado en la tasa de aprendizaje base
-            lr_max_dynamic = lr * (1 + range_scores / (np.std(scores[t_lr_min:t]) + 1e-8))  # Escalado dinámico máximo
-            lr_t = np.clip(lr_t, lr_min_dynamic, lr_max_dynamic)
-
-            # Opcion 4: IQR
-            if len(scores[t_lr_min:t]) >= 2:  # Asegura que hay suficientes datos para calcular percentiles
-                iqr_scores = np.percentile(scores[t_lr_min:t], 90) - np.percentile(scores[t_lr_min:t], 10)
-                lr_t = lr * iqr_scores
-            else:
-                lr_t = lr  # Fallback al valor base
-            
-            # Opcion 5: Historial del gradiente
-            # grad_history = np.cumsum([alpha if covered else -(1 - alpha) for covered in covereds[t_lr_min:t]])
-            # if len(grad_history) > 0:  # Asegúrate de que el historial no esté vacío
-            #    lr_t = lr * range_scores / (1 + np.abs(grad_history[-1]))
-            #else:
-            #    lr_t = lr  # Fallback al valor base
-
-            # Opcion 6: Escalado con raíz cuadrada del tiempo
-            # scaling_factor = np.sqrt(t + 1)
-            # lr_t = lr * range_scores / scaling_factor
-
+        lr_t = calculate_dynamic_learning_rate(
+            scores=scores,
+            t_lr_min=t_lr_min,
+            t=t,
+            lr=lr,
+            alpha=alpha,
+            proportional_lr=proportional_lr,
+            covereds=covereds,
+            option=lr_option
+        )
 
 
         # ======================================
@@ -429,6 +363,7 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         # ================================
         # Componente Derivativo (D)
         # ================================
+
         if scorecast and t_pred > T_burnin and t + ahead < T_test:
             model_filename = f"./model_cache/scorecaster_{t_pred}.pkl"
             
@@ -438,6 +373,7 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
             fitted_model = model.fit()
             # save_model(fitted_model, model_filename)
             scorecasts[t + ahead] = fitted_model.forecast(ahead).iloc[-1]
+
         logs["derivative"].append(scorecasts[t])
 
         # Registrar cobertura
@@ -460,104 +396,6 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
 
     return qs, logs
 
-def apply_pdi_with_calibration(
-    df, 
-    key_col, 
-    date_col, 
-    value_col, 
-    pred_col, 
-    lower_col, 
-    upper_col, 
-    alpha, 
-    lr, 
-    T_burnin, 
-    Csat, 
-    KI, 
-    ahead, 
-    seasonal_period, 
-    set_col
-):
-    """
-    Aplica el método PDI con calibración a un DataFrame que contiene múltiples series.
-
-    Esta función genera intervalos dinámicos de predicción (PDI) para cada serie identificada por `key_col`.
-    Se utilizan conjuntos de datos separados en entrenamiento (TRAIN), calibración (CALIBRATION), 
-    y prueba (TEST) según lo indicado en la columna `set_col`.
-
-    Parámetros:
-    - df (pd.DataFrame): DataFrame que contiene los datos.
-    - key_col (str): Columna que identifica las diferentes series.
-    - date_col (str): Columna que contiene las fechas.
-    - value_col (str): Columna con los valores reales.
-    - pred_col (str): Columna con las predicciones.
-    - lower_col (str): Nombre de la columna donde se guardará el límite inferior del intervalo.
-    - upper_col (str): Nombre de la columna donde se guardará el límite superior del intervalo.
-    - alpha (float): Nivel de significancia (1 - alpha es la cobertura deseada).
-    - lr (float): Tasa de aprendizaje para ajustar el término proporcional.
-    - T_burnin (int): Período de calentamiento antes de aplicar integral y derivativo.
-    - Csat (float): Constante de saturación para el término integral.
-    - KI (float): Escala del componente integral.
-    - ahead (int): Horizonte de predicción (pasos hacia el futuro).
-    - seasonal_period (int): Período de estacionalidad para el modelo derivativo.
-    - set_col (str): Columna que indica el conjunto al que pertenece cada dato (TRAIN, CALIBRATION, TEST).
-
-    Retorna:
-    - pd.DataFrame: DataFrame con los intervalos de predicción (`lower_col`, `upper_col`) generados.
-
-    """
-    # Lista para almacenar los resultados procesados por serie
-    results = []
-
-    # Iterar por cada serie identificada por key_col
-    for key, group in df.groupby(key_col):
-        # Ordenar los datos por la columna de fechas
-        group = group.sort_values(by=date_col)
-
-        # Dividir los datos en conjuntos de entrenamiento, calibración y prueba
-        train, calib, test = split_data_by_set(group, set_col=set_col)
-
-        # ==============================
-        # Datos de Entrenamiento
-        # ==============================
-        y_train = train[value_col].dropna().values  # Valores reales
-        y_pred_train = train[pred_col].dropna().values  # Predicciones
-        scores_train = np.abs(y_train - y_pred_train)  # Cálculo de errores absolutos
-        time_index_train = pd.to_datetime(train[date_col])  # Índice temporal para entrenamiento
-
-        # Calcular intervalos para datos de entrenamiento usando PDI
-        qs_calib = quantile_integrator_log_scorecaster(
-            scores=scores_train,
-            alpha=alpha,
-            lr=lr,
-            T_burnin=T_burnin,
-            Csat=Csat,
-            KI=KI,
-            ahead=ahead,
-            seasonal_period=seasonal_period,
-            time_index=time_index_train
-        )
-
-        # Generar intervalos para el conjunto de entrenamiento
-        train[lower_col] = train[pred_col] - qs_calib
-        train[upper_col] = train[pred_col] + qs_calib
-
-        # ==============================
-        # Datos de Calibración y Prueba
-        # ==============================
-        last_calib_quantile = qs_calib[-1]  # Último cuantil ajustado del entrenamiento
-        # Calibración
-        calib[lower_col] = calib[pred_col] - last_calib_quantile
-        calib[upper_col] = calib[pred_col] + last_calib_quantile
-        # Prueba
-        test[lower_col] = test[pred_col] - last_calib_quantile
-        test[upper_col] = test[pred_col] + last_calib_quantile
-
-        # Agregar los conjuntos procesados a la lista de resultados
-        results.append(pd.concat([train, calib, test]))
-
-    # Combinar los resultados procesados para todas las series
-    return pd.concat(results)
-
 def apply_pdi_with_calibration_with_diagnostics(
     df, 
     key_col, 
@@ -573,7 +411,8 @@ def apply_pdi_with_calibration_with_diagnostics(
     KI, 
     ahead, 
     seasonal_period, 
-    set_col
+    set_col,
+    lr_option
 ):
     """
     Aplica el método PDI con calibración a un DataFrame que contiene múltiples series.
@@ -771,7 +610,6 @@ def plot_series_results_with_sets(
     plt.tight_layout()
     plt.show()
 
-
 def plot_logs(logs):
     """
     Genera gráficos de los logs para analizar el comportamiento de los componentes.
@@ -792,13 +630,12 @@ def plot_logs(logs):
     # Gráfico de Cobertura
     plt.figure(figsize=(12, 6))
     plt.plot(time_steps, logs["coverage"], label="Cobertura Marginal")
-    plt.axhline(y=0.9, color="r", linestyle="--", label="Umbral de Cobertura (90%)")
+    # plt.axhline(y=0.9, color="r", linestyle="--", label="Umbral de Cobertura (90%)")
     plt.legend()
     plt.title("Cobertura Marginal en el Tiempo")
     plt.xlabel("Pasos Temporales")
     plt.ylabel("Cobertura")
     plt.show()
-
 
 def save_logs_to_csv(logs, filename="component_logs.csv"):
     """
@@ -807,3 +644,18 @@ def save_logs_to_csv(logs, filename="component_logs.csv"):
     logs_df = pd.DataFrame(logs)
     logs_df.to_csv(filename, index=False)
     print(f"Logs guardados en {filename}")
+
+def save_model(model, filename):
+    """
+    Guarda un modelo entrenado en un archivo.
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, 'wb') as f:
+        pickle.dump(model, f)
+
+def load_model(filename):
+    """
+    Carga un modelo previamente entrenado desde un archivo.
+    """
+    with open(filename, 'rb') as f:
+        return pickle.load(f)
