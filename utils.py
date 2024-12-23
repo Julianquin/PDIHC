@@ -432,7 +432,8 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         if scorecast and t_pred > T_burnin and t + ahead < T_test:
             model_filename = f"./model_cache/scorecaster_{t_pred}.pkl"
             
-            score_series = pd.Series(scores[:t_pred], index=time_index[:t_pred])
+            #score_series = pd.Series(scores[:t_pred], index=time_index[:t_pred])
+            score_series = pd.Series(scores[:t_pred], index=pd.date_range(start=time_index.iloc[0], periods=len(scores[:t_pred]), freq='D'))
             model = ThetaModel(score_series, period=seasonal_period)
             fitted_model = model.fit()
             # save_model(fitted_model, model_filename)
@@ -443,8 +444,8 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         logs["coverage"].append(covereds[t])
 
         # Alertar si la cobertura es baja
-        if covereds[t] < coverage_threshold:
-            print(f"⚠️ Cobertura baja en el paso {t}: {covereds[t]}")
+        # if covereds[t] < coverage_threshold:
+        #     print(f"⚠️ Cobertura baja en el paso {t}: {covereds[t]}")
 
         # ================================
         # Actualización del Cuantil
@@ -606,7 +607,7 @@ def apply_pdi_with_calibration_with_diagnostics(
     results = []
 
     # Iterar por cada serie identificada por key_col
-    for key, group in df.groupby(key_col):
+    for key, group in tqdm(df.groupby(key_col)):
         # Ordenar los datos por la columna de fechas
         group = group.sort_values(by=date_col)
 
@@ -621,9 +622,12 @@ def apply_pdi_with_calibration_with_diagnostics(
         scores_train = np.abs(y_train - y_pred_train)  # Cálculo de errores absolutos
         time_index_train = pd.to_datetime(train[date_col])  # Índice temporal para entrenamiento
 
+
+        if len(scores_train) == 0:
+            print(f"⚠️ Conjunto de entrenamiento vacío para {key}.")
+            continue
+
         # Calcular intervalos para datos de entrenamiento usando PDI
-
-
         qs_calib, logs = quantile_integrator_log_scorecaster_with_diagnostics(
             scores=scores_train,
             alpha=alpha,
@@ -635,21 +639,25 @@ def apply_pdi_with_calibration_with_diagnostics(
             seasonal_period=seasonal_period,
             time_index=time_index_train
         )
+        
+        if len(qs_calib) == 0:
+            print(f"⚠️ No se generaron cuantiles para {key}.")
+            continue
 
         # Generar intervalos para el conjunto de entrenamiento
-        train[lower_col] = train[pred_col] - qs_calib
-        train[upper_col] = train[pred_col] + qs_calib
+        train.loc[:,lower_col] = train[pred_col] - qs_calib
+        train.loc[:,upper_col] = train[pred_col] + qs_calib
 
         # ==============================
         # Datos de Calibración y Prueba
         # ==============================
         last_calib_quantile = qs_calib[-1]  # Último cuantil ajustado del entrenamiento
         # Calibración
-        calib[lower_col] = calib[pred_col] - last_calib_quantile
-        calib[upper_col] = calib[pred_col] + last_calib_quantile
+        calib.loc[:,lower_col] = calib[pred_col] - last_calib_quantile
+        calib.loc[:,upper_col] = calib[pred_col] + last_calib_quantile
         # Prueba
-        test[lower_col] = test[pred_col] - last_calib_quantile
-        test[upper_col] = test[pred_col] + last_calib_quantile
+        test.loc[:,lower_col] = test[pred_col] - last_calib_quantile
+        test.loc[:,upper_col] = test[pred_col] + last_calib_quantile
 
         # Agregar los conjuntos procesados a la lista de resultados
         results.append(pd.concat([train, calib, test]))

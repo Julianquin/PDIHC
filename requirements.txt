@@ -1,0 +1,10 @@
+numpy
+pandas
+tqdm
+statsmodels
+matplotlib
+snowflake == 1.0.2
+# snowflake-cli-labs ==   3.2.1
+snowflake_connector_python == 3.12.3 
+snowflake_snowpark_python == 1.26.0 
+snowflake_ml_python == 1.7.2

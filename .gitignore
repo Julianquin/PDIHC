@@ -1,0 +1,70 @@
+# Byte-compiled files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.log
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Configuración local
+config.json
+*.env
+
+# Archivos de logs
+*.log
+*.out
+*.err
+logs/
+*.pid
+
+# Archivos de bases de datos locales
+*.sqlite3
+*.db
+
+# Archivos de cache y temporales
+*.cache
+*.tmp
+*.swp
+*.bak
+*.orig
+*.~*
+
+# Archivos de sistemas operativos
+.DS_Store
+Thumbs.db
+
+# Archivos relacionados con IDEs
+.idea/
+.vscode/
+*.code-workspace
+
+# Archivos de herramientas de construcción
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Archivos de pruebas
+.coverage
+*.cover
+*.coverage.*
+.cache
+nosetests.xml
+*.pytest_cache/
+htmlcov/
+junit*.xml
+
+# Configuración de Jupyter Notebook
+.ipynb_checkpoints/
+
+# Archivos específicos de herramientas
+*.mypy_cache/
+*.dmypy.json
+*.pyre/
+.pytest_cache/
+.tox/
