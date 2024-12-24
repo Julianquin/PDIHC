@@ -5,6 +5,7 @@ from statsmodels.tsa.forecasting.theta import ThetaModel
 import matplotlib.pyplot as plt
 import os
 import pickle
+import seaborn as sns
 
 
 # =====================
@@ -113,7 +114,7 @@ def aci(
 #  Preparación de Datos
 # =====================
 
-def generar_datos(n_series=3, n_points=120, seed=42, start_date="2023-01-01"):
+def generar_datos(n_series=3, n_points=120, seed=42, start_date="2023-01-01", noise_std=3,fore_std=7):
     np.random.seed(seed)
     dates = pd.date_range(start=start_date, periods=n_points, freq="D")
 
@@ -126,11 +127,11 @@ def generar_datos(n_series=3, n_points=120, seed=42, start_date="2023-01-01"):
         trend = np.linspace(100, 120, n_points)  # Tendencia lineal
         weekly_seasonality = 10 * np.sin(2 * np.pi * np.arange(n_points) / 7)  # Estacionalidad semanal
         monthly_seasonality = 5 * np.sin(2 * np.pi * np.arange(n_points) / 30)  # Estacionalidad mensual
-        noise = np.random.normal(0, 3, n_points)  # Ruido aleatorio
+        noise = np.random.normal(0, noise_std, n_points)  # Ruido aleatorio
         
         # Valores reales y predicciones
         y_real = trend + weekly_seasonality + monthly_seasonality + noise
-        y_pred = y_real + np.random.normal(0, 7, n_points)  # Agregar ruido adicional a las predicciones
+        y_pred = y_real + np.random.normal(0, fore_std, n_points)  # Agregar ruido adicional a las predicciones
         
         # Etiquetas de futuro
         future = [0] * int(n_points * 0.7) + [1] * int(n_points * 0.3)
@@ -222,7 +223,6 @@ def calculate_dynamic_learning_rate(
     t_lr_min, 
     t, 
     lr, 
-    proportional_lr, 
     alpha, 
     covereds, 
     option
@@ -235,7 +235,6 @@ def calculate_dynamic_learning_rate(
     - t_lr_min (int): Índice mínimo para el cálculo de `lr_t`.
     - t (int): Índice actual.
     - lr (float): Tasa de aprendizaje base.
-    - proportional_lr (bool): Si se usa un escalado proporcional.
     - alpha (float): Nivel de significancia.
     - covereds (np.ndarray): Indicadores de cobertura.
     - option (str): Método de cálculo ('proportional_range', 'simple', 'smoothed', 'iqr', etc.).
@@ -249,10 +248,8 @@ def calculate_dynamic_learning_rate(
     range_scores = scores[t_lr_min:t].max() - scores[t_lr_min:t].min()
 
     if option == "proportional_range":
-        return lr * range_scores if proportional_lr else lr
+        return lr * range_scores 
     
-    elif option == "simple":
-        return lr * range_scores
     
     elif option == "smoothed":
         smoothed_range = pd.Series([range_scores]).rolling(window=3, min_periods=1).mean().iloc[-1]
@@ -299,13 +296,12 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
     ahead, 
     seasonal_period, 
     time_index, 
-    integrate=True, 
-    proportional_lr=True, 
-    scorecast=True,
-    coverage_threshold=0.9,  # Umbral para alertar cobertura baja
-    lr_option="proportional_range"
+    lr_option,
+    integrate,  
+    scorecast, # Umbral para alertar cobertura baja
 ):
     """
+
     Calcula intervalos dinámicos de predicción con diagnóstico detallado.
 
     Retorna:
@@ -337,7 +333,6 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
             t=t,
             lr=lr,
             alpha=alpha,
-            proportional_lr=proportional_lr,
             covereds=covereds,
             option=lr_option
         )
@@ -356,7 +351,7 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         # ============================
         integrator_arg = (1 - covereds)[:t_pred].sum() - (t_pred) * alpha
         # integrator = (np.tan(integrator_arg * np.log(t_pred + 1) / (Csat * (t_pred + 1))) if integrate else 0 )
-        integrator = saturation_fn_log(integrator_arg, t_pred, Csat, KI)
+        integrator = saturation_fn_log(integrator_arg, t_pred, Csat, KI) if integrate else 0
         integrators[t] = integrator
         logs["integral"].append(integrator)
 
@@ -412,7 +407,9 @@ def apply_pdi_with_calibration_with_diagnostics(
     ahead, 
     seasonal_period, 
     set_col,
-    lr_option
+    lr_option, 
+    integrate,
+    scorecast 
 ):
     """
     Aplica el método PDI con calibración a un DataFrame que contiene múltiples series.
@@ -444,6 +441,7 @@ def apply_pdi_with_calibration_with_diagnostics(
     """
     # Lista para almacenar los resultados procesados por serie
     results = []
+    all_logs = {}  # Diccionario para almacenar los logs por serie
 
     # Iterar por cada serie identificada por key_col
     for key, group in tqdm(df.groupby(key_col)):
@@ -476,12 +474,17 @@ def apply_pdi_with_calibration_with_diagnostics(
             KI=KI,
             ahead=ahead,
             seasonal_period=seasonal_period,
-            time_index=time_index_train
+            time_index=time_index_train,
+            lr_option=lr_option,
+            integrate=integrate,
+            scorecast=scorecast,
         )
         
         if len(qs_calib) == 0:
             print(f"⚠️ No se generaron cuantiles para {key}.")
             continue
+
+        all_logs[key] = logs
 
         # Generar intervalos para el conjunto de entrenamiento
         train.loc[:,lower_col] = train[pred_col] - qs_calib
@@ -502,7 +505,7 @@ def apply_pdi_with_calibration_with_diagnostics(
         results.append(pd.concat([train, calib, test]))
 
     # Combinar los resultados procesados para todas las series
-    return pd.concat(results), logs
+    return pd.concat(results), all_logs
 
 # =========================
 #  Evaluación de Resultados
@@ -614,28 +617,101 @@ def plot_logs(logs):
     """
     Genera gráficos de los logs para analizar el comportamiento de los componentes.
     """
-    time_steps = range(len(logs["proportional"]))
+    for key, series_logs in logs.items():
+        time_steps = range(len(series_logs["proportional"]))
 
-    # Gráfico de Componentes
-    plt.figure(figsize=(12, 6))
-    plt.plot(time_steps, logs["proportional"], label="Proporcional")
-    plt.plot(time_steps, logs["integral"], label="Integral")
-    plt.plot(time_steps, logs["derivative"], label="Derivativo")
-    plt.legend()
-    plt.title("Contribución de Componentes en el Tiempo")
+        # Gráfico de Componentes
+        plt.figure(figsize=(12, 6))
+        plt.plot(time_steps, series_logs["proportional"], label="Proporcional")
+        plt.plot(time_steps, series_logs["integral"], label="Integral")
+        plt.plot(time_steps, series_logs["derivative"], label="Derivativo")
+        plt.legend()
+        plt.title(f"Contribución de Componentes - {key}")
+        plt.xlabel("Pasos Temporales")
+        plt.ylabel("Valor")
+        plt.show()
+
+        # Gráfico de Cobertura
+        plt.figure(figsize=(12, 6))
+        plt.plot(time_steps, series_logs["coverage"], label="Cobertura Marginal")
+        plt.title(f"Cobertura Marginal - {key}")
+        plt.xlabel("Pasos Temporales")
+        plt.ylabel("Cobertura")
+        plt.show()
+
+
+
+def plot_heatmap(logs, component):
+    all_series = []
+    max_length = max(len(series_logs[component]) for series_logs in logs.values())
+    
+    for series_logs in logs.values():
+        series_data = series_logs[component]
+        padded_data = np.pad(series_data, (0, max_length - len(series_data)), mode="constant", constant_values=np.nan)
+        all_series.append(padded_data)
+    
+    heatmap_data = np.array(all_series)
+    plt.figure(figsize=(12, 8))
+    sns.heatmap(heatmap_data, cmap="viridis", cbar=True)
+    plt.title(f"Heatmap de {component.capitalize()}")
     plt.xlabel("Pasos Temporales")
-    plt.ylabel("Valor")
+    plt.ylabel("Series")
+    plt.show()
+
+
+def aggregate_logs_average(logs):
+    aggregated_logs = {
+        "proportional": [],
+        "integral": [],
+        "derivative": [],
+        "coverage": []
+    }
+    max_length = max(len(series_logs["proportional"]) for series_logs in logs.values())
+    
+    for t in range(max_length):
+        proportional_vals = [series_logs["proportional"][t] for series_logs in logs.values() if t < len(series_logs["proportional"])]
+        integral_vals = [series_logs["integral"][t] for series_logs in logs.values() if t < len(series_logs["integral"])]
+        derivative_vals = [series_logs["derivative"][t] for series_logs in logs.values() if t < len(series_logs["derivative"])]
+        coverage_vals = [series_logs["coverage"][t] for series_logs in logs.values() if t < len(series_logs["coverage"])]
+        
+        aggregated_logs["proportional"].append(np.mean(proportional_vals))
+        aggregated_logs["integral"].append(np.mean(integral_vals))
+        aggregated_logs["derivative"].append(np.mean(derivative_vals))
+        aggregated_logs["coverage"].append(np.mean(coverage_vals))
+    
+    return aggregated_logs
+
+def plot_logs_agg(logs):
+    """
+    Genera gráficos de los logs para analizar el comportamiento agregado de los componentes y la cobertura.
+    
+    Parámetros:
+    - logs (dict): Diccionario de componentes con listas de valores promedio por paso temporal.
+    """
+    time_steps = range(len(next(iter(logs.values()))))  # Número de pasos temporales
+
+    # Gráfico de Contribuciones (Proporcional, Integral, Derivativa)
+    plt.figure(figsize=(12, 6))
+    for component in ["proportional", "integral", "derivative"]:
+        if component in logs:  # Asegurarse de que el componente existe en los logs
+            plt.plot(time_steps, logs[component], label=component.capitalize())
+    plt.legend()
+    plt.title("Contribuciones Promedio de los Componentes en el Tiempo")
+    plt.xlabel("Pasos Temporales")
+    plt.ylabel("Valor Promedio")
     plt.show()
 
     # Gráfico de Cobertura
-    plt.figure(figsize=(12, 6))
-    plt.plot(time_steps, logs["coverage"], label="Cobertura Marginal")
-    # plt.axhline(y=0.9, color="r", linestyle="--", label="Umbral de Cobertura (90%)")
-    plt.legend()
-    plt.title("Cobertura Marginal en el Tiempo")
-    plt.xlabel("Pasos Temporales")
-    plt.ylabel("Cobertura")
-    plt.show()
+    if "coverage" in logs:  # Asegurarse de que la cobertura existe en los logs
+        plt.figure(figsize=(12, 6))
+        plt.plot(time_steps, logs["coverage"], label="Cobertura")
+        plt.axhline(y=0.95, color="r", linestyle="--", label="Umbral de Cobertura (95%)")
+        plt.legend()
+        plt.title("Cobertura Promedio en el Tiempo")
+        plt.xlabel("Pasos Temporales")
+        plt.ylabel("Cobertura Promedio")
+        plt.show()
+
 
 def save_logs_to_csv(logs, filename="component_logs.csv"):
     """
