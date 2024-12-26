@@ -1,4 +1,4 @@
-# PDIHC - PDI Haute Couture
+# PIDHC - PID Haute Couture
 
 
 ## **1. Objetivo**
