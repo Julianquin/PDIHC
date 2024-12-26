@@ -7,6 +7,9 @@ import os
 import pickle
 import seaborn as sns
 
+from prophet import Prophet
+import lightgbm as lgb
+from sklearn.linear_model import Ridge
 
 # =====================
 #  Baseline Methods
@@ -281,6 +284,112 @@ def calculate_dynamic_learning_rate(
     else:
         raise ValueError(f"Opción desconocida para la tasa de aprendizaje: {option}")
 
+def create_features(scores, time_index, exogenous_vars=None, ahead=30):
+    """
+    Genera características para modelos basados en regresión a partir de una serie temporal.
+
+    Parámetros:
+    - scores (np.ndarray): Serie temporal de valores.
+    - time_index (pd.DatetimeIndex): Índices de tiempo correspondientes a los valores.
+    - exogenous_vars (pd.DataFrame): Variables exógenas correspondientes al tiempo (opcional).
+    - ahead (int): Horizonte de predicción en días.
+
+    Retorna:
+    - pd.DataFrame: DataFrame con las características generadas.
+    """
+    # Convertir a DataFrame
+    df = pd.DataFrame({
+        'y': scores,
+        'time': time_index
+    })
+
+    # Crear características temporales
+    df['day_of_week'] = df['time'].dt.dayofweek
+    df['day_of_month'] = df['time'].dt.day
+    df['month'] = df['time'].dt.month
+    df['year'] = df['time'].dt.year
+    df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+
+    # Rolling statistics (ventanas móviles)
+    rolling_windows = [7, 14, 30]
+    # for window in rolling_windows:
+    #     df[f'rolling_mean_{window}'] = df['y'].shift(ahead).rolling(window=window).mean()
+    #     df[f'rolling_std_{window}'] = df['y'].shift(ahead).rolling(window=window).std()
+
+    # Incluir variables exógenas si están disponibles
+    if exogenous_vars is not None:
+        for col in exogenous_vars.columns:
+            df[col] = exogenous_vars[col].values
+
+    # Eliminar filas con valores NaN debido a lags y rolling stats
+    df = df.dropna().reset_index(drop=True)
+
+    # Eliminar columna de tiempo si no es necesaria
+    df = df.drop(columns=['time'], errors='ignore')
+
+    return df
+
+def generic_forecaster(model_type, scores, time_index, seasonal_period, ahead, exogenous_vars=None):
+    """
+    Función genérica para realizar predicciones usando diferentes modelos.
+
+    Parámetros:
+    - model_type (str): Tipo de modelo a usar ('theta', 'prophet', 'ridge', 'lightgbm').
+    - scores (np.ndarray): Valores históricos de la serie temporal.
+    - time_index (pd.DatetimeIndex): Índices de tiempo correspondientes a los valores.
+    - seasonal_period (int): Período estacional (usado en Theta y Prophet).
+    - ahead (int): Horizonte de predicción.
+    - exogenous_vars (pd.DataFrame): Variables exógenas correspondientes al tiempo (opcional).
+
+    Retorna:
+    - float: Predicción para el horizonte especificado.
+    """
+    if model_type == "theta":
+        score_series = pd.Series(scores, index=pd.date_range(start=time_index[0], periods=len(scores), freq='D'))
+        model = ThetaModel(score_series, period=seasonal_period)
+        fitted_model = model.fit()
+        return fitted_model.forecast(ahead).iloc[-1]
+    
+    elif model_type == "prophet":
+        df = pd.DataFrame({'ds': time_index, 'y': scores})
+        if exogenous_vars is not None:
+            for col in exogenous_vars.columns:
+                df[col] = exogenous_vars[col]
+        model = Prophet()
+        if exogenous_vars is not None:
+            for col in exogenous_vars.columns:
+                model.add_regressor(col)
+        model.fit(df)
+        future = model.make_future_dataframe(periods=ahead)
+        if exogenous_vars is not None:
+            for col in exogenous_vars.columns:
+                future[col] = exogenous_vars[col].iloc[-ahead:]
+        forecast = model.predict(future)
+        return forecast.iloc[-1]['yhat']
+
+    elif model_type == "ridge":
+        # Suponiendo que se han generado características para Ridge
+        from sklearn.linear_model import Ridge
+        features = create_features(scores, time_index, exogenous_vars)
+        model = Ridge()
+        X_train, y_train = features[:-ahead], scores[:-ahead]
+        model.fit(X_train, y_train)
+        return model.predict(features[-ahead:])[0]
+
+    elif model_type == "lightgbm":
+        import lightgbm as lgb
+        features = create_features(scores, time_index, exogenous_vars)
+        X_train, y_train = features[:-ahead], scores[:-ahead]
+        train_data = lgb.Dataset(X_train, label=y_train)
+        params = {'objective': 'regression', 'boosting_type': 'gbdt', 'verbosity': -1}
+        model = lgb.train(params, train_data, num_boost_round=100)
+        return model.predict(features[-ahead:])[0]
+
+    else:
+        raise ValueError(f"Modelo '{model_type}' no soportado.")
+
+
+
 
 # ==============================
 #  Cálculo de Intervalos - PDI
@@ -298,7 +407,8 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
     time_index, 
     lr_option,
     integrate,  
-    scorecast, # Umbral para alertar cobertura baja
+    scorecast, 
+    model_type 
 ):
     """
 
@@ -317,6 +427,7 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
 
     # Logs para análisis posterior
     logs = {"proportional": [], "integral": [], "derivative": [], "coverage": []}
+
 
     for t in tqdm(range(T_test)):
         t_pred = t - ahead + 1
@@ -361,13 +472,15 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
 
         if scorecast and t_pred > T_burnin and t + ahead < T_test:
             model_filename = f"./model_cache/scorecaster_{t_pred}.pkl"
-            
-            #score_series = pd.Series(scores[:t_pred], index=time_index[:t_pred])
-            score_series = pd.Series(scores[:t_pred], index=pd.date_range(start=time_index.iloc[0], periods=len(scores[:t_pred]), freq='D'))
-            model = ThetaModel(score_series, period=seasonal_period)
-            fitted_model = model.fit()
-            # save_model(fitted_model, model_filename)
-            scorecasts[t + ahead] = fitted_model.forecast(ahead).iloc[-1]
+            scorecasts[t + ahead] = generic_forecaster(
+                model_type=model_type,  # Cambia a "theta" "prophet", "ridge", o "lightgbm" según lo que quieras probar
+                scores=scores[:t_pred],
+                time_index=pd.date_range(start=time_index.iloc[0], periods=len(scores[:t_pred]), freq='D'),
+                seasonal_period=seasonal_period,
+                ahead=ahead,
+                exogenous_vars=None  # Cambia esto si tienes variables exógenas
+            )
+
 
         logs["derivative"].append(scorecasts[t])
 
@@ -388,8 +501,10 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
             qs[t + 1] = qts[t + 1] + integrators[t + 1]
             if scorecast:
                 qs[t + 1] += scorecasts[t + 1]
-
+    
     return qs, logs
+
+
 
 def apply_pdi_with_calibration_with_diagnostics(
     df, 
@@ -407,9 +522,11 @@ def apply_pdi_with_calibration_with_diagnostics(
     ahead, 
     seasonal_period, 
     set_col,
-    lr_option, 
-    integrate,
-    scorecast 
+    lr_option = 'proportional_range',
+    integrate = True,  
+    scorecast = True, 
+    model_type = 'theta',
+    smooth_method ='volatil_weighted'
 ):
     """
     Aplica el método PDI con calibración a un DataFrame que contiene múltiples series.
@@ -465,7 +582,7 @@ def apply_pdi_with_calibration_with_diagnostics(
             continue
 
         # Calcular intervalos para datos de entrenamiento usando PDI
-        qs_calib, logs = quantile_integrator_log_scorecaster_with_diagnostics(
+        qs_calib, logs  = quantile_integrator_log_scorecaster_with_diagnostics(
             scores=scores_train,
             alpha=alpha,
             lr=lr,
@@ -478,6 +595,7 @@ def apply_pdi_with_calibration_with_diagnostics(
             lr_option=lr_option,
             integrate=integrate,
             scorecast=scorecast,
+            model_type=model_type,
         )
         
         if len(qs_calib) == 0:
@@ -493,13 +611,37 @@ def apply_pdi_with_calibration_with_diagnostics(
         # ==============================
         # Datos de Calibración y Prueba
         # ==============================
-        last_calib_quantile = qs_calib[-1]  # Último cuantil ajustado del entrenamiento
+        
+
+        # qs_smooth = kalman_filter(observations=qs_calib, initial_state=qs_calib[0], process_variance=0.1, measurement_variance=0.2)[-1]
+        # qs_smooth = qs_calib[-1]        
+        # qs_smooth = volatility_weighted_average(qs_calib)
+
+
+
+        if smooth_method == "last":
+            # Usar el último cuantil
+            qs_smooth = qs_calib[-1]
+        
+        elif smooth_method == "kalman":
+            # Filtro de Kalman
+            qs_smooth = kalman_filter(
+                observations=qs_calib,
+                initial_state=qs_calib[0],
+                process_variance=0.1,
+                measurement_variance= 0.2 
+            )[-1]
+        
+        elif smooth_method == "volatil_weighted":
+            qs_smooth = volatility_weighted_average(qs_calib)
+
+
         # Calibración
-        calib.loc[:,lower_col] = calib[pred_col] - last_calib_quantile
-        calib.loc[:,upper_col] = calib[pred_col] + last_calib_quantile
+        calib.loc[:,lower_col] = calib[pred_col] - qs_smooth  
+        calib.loc[:,upper_col] = calib[pred_col] + qs_smooth 
         # Prueba
-        test.loc[:,lower_col] = test[pred_col] - last_calib_quantile
-        test.loc[:,upper_col] = test[pred_col] + last_calib_quantile
+        test.loc[:,lower_col] = test[pred_col] - qs_smooth 
+        test.loc[:,upper_col] = test[pred_col] + qs_smooth 
 
         # Agregar los conjuntos procesados a la lista de resultados
         results.append(pd.concat([train, calib, test]))
@@ -735,3 +877,63 @@ def load_model(filename):
     """
     with open(filename, 'rb') as f:
         return pickle.load(f)
+
+
+
+
+def kalman_filter(observations, initial_state, process_variance, measurement_variance):
+    """
+    Implementa un filtro Kalman para suavizar observaciones.
+
+    Parámetros:
+    - observations (np.ndarray): Serie de observaciones (e.g., valores del cuantil).
+    - initial_state (float): Estado inicial estimado.
+    - process_variance (float): Variabilidad del proceso (ruido del modelo).
+    - measurement_variance (float): Variabilidad de las observaciones (ruido del sensor).
+
+    Retorna:
+    - np.ndarray: Serie suavizada.
+    """
+    n = len(observations)
+    x = np.zeros(n)  # Estado estimado
+    P = np.zeros(n)  # Incertidumbre del estado
+
+    # Inicialización
+    x[0] = initial_state
+    P[0] = process_variance
+
+    for t in range(1, n):
+        # Predicción
+        x_pred = x[t - 1]
+        P_pred = P[t - 1] + process_variance
+
+        # Actualización
+        K = P_pred / (P_pred + measurement_variance)  # Ganancia de Kalman
+        x[t] = x_pred + K * (observations[t] - x_pred)
+        P[t] = (1 - K) * P_pred
+
+    return x
+
+
+def volatility_weighted_average(qs):
+    """
+    Promedio ponderado dinámico basado en la volatilidad de cada ventana.
+    """
+    vol_7 = np.std(qs[-7:]) if len(qs) >= 7 else np.std(qs)
+    vol_15 = np.std(qs[-15:]) if len(qs) >= 15 else np.std(qs)
+    vol_30 = np.std(qs[-30:]) if len(qs) >= 30 else np.std(qs)
+
+    # Invertir volatilidades para usar como pesos
+    inv_vols = np.array([1 / vol_7, 1 / vol_15, 1 / vol_30])
+    normalized_weights = inv_vols / inv_vols.sum()
+
+    # Calcular medias móviles
+    qs_last_7 = np.mean(qs[-7:]) if len(qs) >= 7 else np.mean(qs)
+    qs_last_15 = np.mean(qs[-15:]) if len(qs) >= 15 else np.mean(qs)
+    qs_last_30 = np.mean(qs[-30:]) if len(qs) >= 30 else np.mean(qs)
+
+    return (
+        normalized_weights[0] * qs_last_7
+        + normalized_weights[1] * qs_last_15
+        + normalized_weights[2] * qs_last_30
+    )
