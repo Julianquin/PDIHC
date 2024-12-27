@@ -3,7 +3,7 @@
 
 ## **1. Objetivo**
 
-Este proyecto tiene como objetivo principal implementar, adaptar y evaluar el método **PDI (Proportional-Integral-Derivative)** para generar intervalos de predicción dinámicos en series temporales. El método está diseñado para cumplir con una cobertura específica $1-\alpha$, ajustándose en línea con base en tres componentes principales: proporcional, integral y derivativo.
+Este proyecto tiene como objetivo principal implementar, adaptar y evaluar el método **PID (Proportional-Integral-Derivative)** para generar intervalos de predicción dinámicos en series temporales. El método está diseñado para cumplir con una cobertura específica $1-\alpha$, ajustándose en línea con base en tres componentes principales: proporcional, integral y derivativo.
 
 Además, se busca integrar este enfoque en un marco práctico que permita:
 - Trabajar con un `DataFrame` que contenga múltiples series temporales identificadas por una clave (`KEY`).
@@ -27,7 +27,7 @@ Además, se busca integrar este enfoque en un marco práctico que permita:
 2. **Función `split_data_by_set`**:
    - Permite dividir los datos de una serie específica en los conjuntos mencionados anteriormente.
 
-### **B. Implementación del Método PDI**
+### **B. Implementación del Método PID**
 
 #### **1. Método Principal: `quantile_integrator_log_scorecaster`**
 - Este método ajusta los intervalos dinámicamente utilizando los tres componentes PID:
@@ -41,7 +41,7 @@ Además, se busca integrar este enfoque en un marco práctico que permita:
     - Anticipa cambios futuros en los errores utilizando el modelo `ThetaModel`.
 
 #### **2. Aplicación del Método a Datos Reales**
-- La función `apply_pdi_with_calibration` adapta el método PDI a un `DataFrame` que contiene múltiples series.
+- La función `apply_PID_with_calibration` adapta el método PID a un `DataFrame` que contiene múltiples series.
   - Para cada serie:
     - Ajusta los intervalos dinámicamente en el conjunto de entrenamiento (`TRAIN`).
     - Genera intervalos consistentes para los conjuntos de calibración (`CALIBRATION`) y prueba (`TEST`).
@@ -76,8 +76,8 @@ Además, se busca integrar este enfoque en un marco práctico que permita:
 - `split_data_by_set`: Divide un grupo en los conjuntos mencionados.
 
 ### **B. Cálculo de Intervalos**
-- `quantile_integrator_log_scorecaster`: Implementa el método PDI para ajustar intervalos dinámicos.
-- `apply_pdi_with_calibration`: Aplica PDI a un DataFrame con múltiples series.
+- `quantile_integrator_log_scorecaster`: Implementa el método PID para ajustar intervalos dinámicos.
+- `apply_PID_with_calibration`: Aplica PID a un DataFrame con múltiples series.
 
 ### **C. Evaluación y Visualización**
 - `calculate_metrics`: Calcula métricas de evaluación (Marginal Coverage, Average Region Size, Conditional Coverage).
@@ -86,7 +86,7 @@ Además, se busca integrar este enfoque en un marco práctico que permita:
 
 ## **4. Parámetros del Modelo**
 
-Los parámetros principales del modelo PDI incluyen:
+Los parámetros principales del modelo PID incluyen:
 
 1. **Cobertura y Aprendizaje**:
    - `alpha`: Nivel de significancia deseado, que determina la cobertura esperada ($1 - \alpha$).
