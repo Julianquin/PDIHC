@@ -117,29 +117,50 @@ def aci(
 #  Preparación de Datos
 # =====================
 
-def generar_datos(n_series=3, n_points=120, seed=42, start_date="2023-01-01", noise_std=3,fore_std=7):
-    np.random.seed(seed)
+def generar_datos(
+    n_series=3, 
+    n_points=120, 
+    seed=42, 
+    start_date="2023-01-01", 
+    noise_std=3, 
+    fore_std=7,
+    promo_periods=None
+):
+    # np.random.seed(seed)
     dates = pd.date_range(start=start_date, periods=n_points, freq="D")
 
-    # Generación de datos
     data = []
     for i in range(1, n_series + 1):
         key = f"SERIE_{i}"
         
-        # Componentes básicos
-        trend = np.linspace(100, 120, n_points)  # Tendencia lineal
-        weekly_seasonality = 10 * np.sin(2 * np.pi * np.arange(n_points) / 7)  # Estacionalidad semanal
-        monthly_seasonality = 5 * np.sin(2 * np.pi * np.arange(n_points) / 30)  # Estacionalidad mensual
-        noise = np.random.normal(0, noise_std, n_points)  # Ruido aleatorio
+        trend = np.linspace(100, 120, n_points)
+        weekly_seasonality = 10 * np.sin(2 * np.pi * np.arange(n_points) / 7)
+        monthly_seasonality = 5 * np.sin(2 * np.pi * np.arange(n_points) / 30)
+        noise = np.random.normal(0, noise_std, n_points)
         
-        # Valores reales y predicciones
-        y_real = trend + weekly_seasonality + monthly_seasonality + noise
-        y_pred = y_real + np.random.normal(0, fore_std, n_points)  # Agregar ruido adicional a las predicciones
-        
-        # Etiquetas de futuro
+        # Inicializar X como 0
+        x_uncertainty = np.zeros(n_points)
+        if promo_periods:
+            for start, end in promo_periods:
+                start_idx = max(0, (pd.Timestamp(start) - pd.Timestamp(start_date)).days)
+                end_idx = min(n_points, (pd.Timestamp(end) - pd.Timestamp(start_date)).days + 1)
+                x_uncertainty[start_idx:end_idx] = 1
+
+        y_real = []
+        y_pred = []
+        for idx in range(n_points):
+            # Calcular real y predicción con impacto de X
+            base = trend[idx] + weekly_seasonality[idx] + monthly_seasonality[idx]
+            if x_uncertainty[idx] == 1:
+                base += 40  # Cambio estructural
+                y_real.append(base + np.random.normal(0, noise_std * 3))  # Más ruido
+                y_pred.append(base + np.random.normal(0, fore_std * 2.5))  # Más error
+            else:
+                y_real.append(base + noise[idx])
+                y_pred.append(base + np.random.normal(0, fore_std))
+
         future = [0] * int(n_points * 0.7) + [1] * int(n_points * 0.3)
-        
-        # Construir el DataFrame
+
         data.extend({
             "KEY": key,
             "FECHA": date,
@@ -148,10 +169,12 @@ def generar_datos(n_series=3, n_points=120, seed=42, start_date="2023-01-01", no
             "FUTURE": fut,
             "YHAT_L": np.nan,
             "YHAT_U": np.nan,
-        } for date, real, pred, fut in zip(dates, y_real, y_pred, future))
+            "X": x_uncertainty[idx],
+        } for idx, (date, real, pred, fut) in enumerate(zip(dates, y_real, y_pred, future)))
 
     df = pd.DataFrame(data)
     return df
+
 
 def assign_data_sets(df, date_col, future_col, calib_ratio=0.6):
     """
