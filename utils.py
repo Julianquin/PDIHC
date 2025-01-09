@@ -175,7 +175,6 @@ def generar_datos(
     df = pd.DataFrame(data)
     return df
 
-
 def assign_data_sets(df, date_col, future_col, calib_ratio=0.6):
     """
     Asigna etiquetas de conjunto (TRAIN, CALIBRATION, TEST) a un DataFrame.
@@ -368,10 +367,30 @@ def generic_forecaster(model_type, scores, time_index, seasonal_period, ahead, e
     - float: Predicción para el horizonte especificado.
     """
     if model_type == "theta":
+        # Modelo Theta
         score_series = pd.Series(scores, index=pd.date_range(start=time_index[0], periods=len(scores), freq='D'))
         model = ThetaModel(score_series, period=seasonal_period)
         fitted_model = model.fit()
-        return fitted_model.forecast(ahead).iloc[-1]
+        theta_forecast = fitted_model.forecast(ahead).iloc[-1]
+
+        if exogenous_vars is not None:
+            # Incorporar regresión lineal simple con la variable X
+            from sklearn.linear_model import LinearRegression
+            
+            # Ajustar residuals para coincidir con exogenous_vars.iloc[:-ahead]
+            residuals = scores[:-ahead] - fitted_model.forecast(len(scores[:-ahead])).values
+            
+            lin_reg = LinearRegression()
+            lin_reg.fit(exogenous_vars.iloc[:-ahead], residuals)
+
+            # Predecir impacto de las variables exógenas
+            reg_correction = lin_reg.predict(exogenous_vars.iloc[-ahead:])[-1]
+
+            # Combinar predicción de Theta con corrección por regresión
+            return theta_forecast + reg_correction
+
+        return theta_forecast
+
     
     elif model_type == "prophet":
         df = pd.DataFrame({'ds': time_index, 'y': scores})
@@ -412,8 +431,6 @@ def generic_forecaster(model_type, scores, time_index, seasonal_period, ahead, e
         raise ValueError(f"Modelo '{model_type}' no soportado.")
 
 
-
-
 # ==============================
 #  Cálculo de Intervalos - PDI
 # ==============================
@@ -431,16 +448,62 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
     lr_option,
     integrate,  
     scorecast, 
-    model_type 
+    model_type,
+    exogenous_vars=None
 ):
     """
+    Calcula intervalos dinámicos de predicción (PDI) utilizando un modelo de integración cuantílica 
+    con diagnóstico detallado basado en las contribuciones proporcional, integral y derivativa.
 
-    Calcula intervalos dinámicos de predicción con diagnóstico detallado.
+
+    Parámetros:
+    ----------
+    scores : np.ndarray
+        Errores absolutos históricos entre valores reales y predichos.
+    alpha : float
+        Nivel de significancia (1 - alpha es la cobertura deseada).
+    lr : float
+        Tasa de aprendizaje para ajustar el término proporcional.
+    T_burnin : int
+        Número de pasos iniciales para el calentamiento antes de activar los ajustes derivativos.
+    Csat : float
+        Constante que escala la saturación en el componente integral.
+    KI : float
+        Constante que ajusta la sensibilidad del término integral a los errores acumulados.
+    ahead : int
+        Horizonte de predicción en pasos temporales hacia adelante.
+    seasonal_period : int
+        Período estacional utilizado por el modelo derivativo.
+    time_index : pd.DatetimeIndex
+        Índices temporales correspondientes a los datos históricos.
+    lr_option : str
+        Método para calcular la tasa de aprendizaje dinámica ('proportional_range' u otros).
+    integrate : bool
+        Si True, activa el componente integral del modelo.
+    scorecast : bool
+        Si True, utiliza un modelo derivativo basado en predicciones.
+    model_type : str
+        Tipo de modelo derivativo a utilizar ('theta', 'prophet', etc.).
+    exogenous_vars : pd.DataFrame, optional
+        Variables exógenas para el modelo derivativo, si están disponibles.
 
     Retorna:
-    - qs (np.ndarray): Intervalos ajustados dinámicamente.
-    - logs (dict): Logs detallados de cada componente.
+    -------
+    qs : np.ndarray
+        Intervalos ajustados dinámicamente en cada paso temporal.
+    logs : dict
+        Diccionario que contiene métricas detalladas para diagnóstico:
+        - "proportional": Actualizaciones proporcionales en cada paso.
+        - "integral": Actualizaciones integrales acumuladas.
+        - "derivative": Actualizaciones derivativas (predicciones del modelo derivativo).
+        - "coverage": Indicador de si el cuantil cubrió el error en cada paso.
+        - "cumulative_coverage": Cobertura acumulativa hasta cada paso.
+        - "band_width": Amplitud de las bandas de predicción en cada paso.
+        - "band_shift": Desplazamiento de las bandas respecto a los valores reales.
+        - "band_asymmetry": Diferencia de asimetría entre los límites superior e inferior de las bandas.
     """
+
+
     T_test = scores.shape[0]
     qs = np.zeros((T_test,))
     qts = np.zeros((T_test,))
@@ -449,8 +512,18 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
     covereds = np.zeros((T_test,))
 
     # Logs para análisis posterior
-    logs = {"proportional": [], "integral": [], "derivative": [], "coverage": []}
+    logs = {
+        "proportional": [], 
+        "integral": [], 
+        "derivative": [], 
+        "coverage": [],
+        "band_width": [],
+        "band_shift": [],
+        "cumulative_coverage": [],
+        "band_asymmetry": []
+    }
 
+    cumulative_coverage = 0  # Para calcular cobertura acumulativa
 
     for t in tqdm(range(T_test)):
         t_pred = t - ahead + 1
@@ -471,7 +544,6 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
             option=lr_option
         )
 
-
         # ======================================
         # Componente Proporcional y Gradiente (P)
         # ======================================
@@ -484,7 +556,6 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         # Componente Integral (I)
         # ============================
         integrator_arg = (1 - covereds)[:t_pred].sum() - (t_pred) * alpha
-        # integrator = (np.tan(integrator_arg * np.log(t_pred + 1) / (Csat * (t_pred + 1))) if integrate else 0 )
         integrator = saturation_fn_log(integrator_arg, t_pred, Csat, KI) if integrate else 0
         integrators[t] = integrator
         logs["integral"].append(integrator)
@@ -494,40 +565,41 @@ def quantile_integrator_log_scorecaster_with_diagnostics(
         # ================================
 
         if scorecast and t_pred > T_burnin and t + ahead < T_test:
-            model_filename = f"./model_cache/scorecaster_{t_pred}.pkl"
             scorecasts[t + ahead] = generic_forecaster(
-                model_type=model_type,  # Cambia a "theta" "prophet", "ridge", o "lightgbm" según lo que quieras probar
+                model_type=model_type,
                 scores=scores[:t_pred],
                 time_index=pd.date_range(start=time_index.iloc[0], periods=len(scores[:t_pred]), freq='D'),
                 seasonal_period=seasonal_period,
                 ahead=ahead,
-                exogenous_vars=None  # Cambia esto si tienes variables exógenas
+                exogenous_vars=exogenous_vars.iloc[:t_pred] if exogenous_vars is not None else None
             )
-
 
         logs["derivative"].append(scorecasts[t])
 
         # Registrar cobertura
         logs["coverage"].append(covereds[t])
-
-        # Alertar si la cobertura es baja
-        # if covereds[t] < coverage_threshold:
-        #     print(f"⚠️ Cobertura baja en el paso {t}: {covereds[t]}")
+        cumulative_coverage += covereds[t]
+        logs["cumulative_coverage"].append(cumulative_coverage / (t + 1))
 
         # ================================
         # Actualización del Cuantil
         # ================================
         if t < T_test - 1:
             qts[t + 1] = qts[t] + proportional_update
-            
             integrators[t + 1] = integrator if integrate else 0
             qs[t + 1] = qts[t + 1] + integrators[t + 1]
             if scorecast:
                 qs[t + 1] += scorecasts[t + 1]
-    
+
+            # Logs de las bandas
+            band_width = qs[t + 1] - qs[t]
+            band_shift = qs[t + 1] - scores[t]
+            band_asymmetry = abs((qs[t + 1] - scores[t]) - (scores[t] - qs[t]))
+            logs["band_width"].append(band_width)
+            logs["band_shift"].append(band_shift)
+            logs["band_asymmetry"].append(band_asymmetry)
+
     return qs, logs
-
-
 
 def apply_pdi_with_calibration_with_diagnostics(
     df, 
@@ -545,11 +617,11 @@ def apply_pdi_with_calibration_with_diagnostics(
     ahead, 
     seasonal_period, 
     set_col,
-    lr_option = 'proportional_range',
-    integrate = True,  
-    scorecast = True, 
-    model_type = 'theta',
-    smooth_method ='volatil_weighted'
+    lr_option='proportional_range',
+    integrate=True,  
+    scorecast=True, 
+    model_type='theta',
+    smooth_method='volatil_weighted'
 ):
     """
     Aplica el método PDI con calibración a un DataFrame que contiene múltiples series.
@@ -579,17 +651,23 @@ def apply_pdi_with_calibration_with_diagnostics(
     - pd.DataFrame: DataFrame con los intervalos de predicción (`lower_col`, `upper_col`) generados.
 
     """
-    # Lista para almacenar los resultados procesados por serie
-    results = []
+    results = []  # Lista para almacenar los resultados procesados por serie
     all_logs = {}  # Diccionario para almacenar los logs por serie
 
     # Iterar por cada serie identificada por key_col
     for key, group in tqdm(df.groupby(key_col)):
-        # Ordenar los datos por la columna de fechas
-        group = group.sort_values(by=date_col)
+        group = group.sort_values(by=date_col)  # Ordenar por fecha
 
         # Dividir los datos en conjuntos de entrenamiento, calibración y prueba
         train, calib, test = split_data_by_set(group, set_col=set_col)
+        # Crear copias completas para evitar warnings
+        calib = calib.copy()
+        test = test.copy()
+
+        if 'X' not in calib.columns:
+            calib.loc[:, 'X'] = 0
+        if 'X' not in test.columns:
+            test.loc[:, 'X'] = 0
 
         # ==============================
         # Datos de Entrenamiento
@@ -597,15 +675,15 @@ def apply_pdi_with_calibration_with_diagnostics(
         y_train = train[value_col].dropna().values  # Valores reales
         y_pred_train = train[pred_col].dropna().values  # Predicciones
         scores_train = np.abs(y_train - y_pred_train)  # Cálculo de errores absolutos
-        time_index_train = pd.to_datetime(train[date_col])  # Índice temporal para entrenamiento
-
+        time_index_train = pd.to_datetime(train[date_col])  # Índice temporal
+        exogenous_train = train[['X']] if 'X' in train.columns else None
 
         if len(scores_train) == 0:
             print(f"⚠️ Conjunto de entrenamiento vacío para {key}.")
             continue
 
         # Calcular intervalos para datos de entrenamiento usando PDI
-        qs_calib, logs  = quantile_integrator_log_scorecaster_with_diagnostics(
+        qs_calib, logs = quantile_integrator_log_scorecaster_with_diagnostics(
             scores=scores_train,
             alpha=alpha,
             lr=lr,
@@ -619,6 +697,7 @@ def apply_pdi_with_calibration_with_diagnostics(
             integrate=integrate,
             scorecast=scorecast,
             model_type=model_type,
+            exogenous_vars=exogenous_train
         )
         
         if len(qs_calib) == 0:
@@ -628,48 +707,62 @@ def apply_pdi_with_calibration_with_diagnostics(
         all_logs[key] = logs
 
         # Generar intervalos para el conjunto de entrenamiento
-        train.loc[:,lower_col] = train[pred_col] - qs_calib
-        train.loc[:,upper_col] = train[pred_col] + qs_calib
+        train.loc[:, lower_col] = train[pred_col] - qs_calib
+        train.loc[:, upper_col] = train[pred_col] + qs_calib
+
+        # =============================
+        # Cuantiles Condicionales en X
+        # =============================
+        if 'X' in train.columns:
+            qs_promo_vals = qs_calib[train["X"] == 1]
+            qs_no_promo_vals = qs_calib[train["X"] == 0]
+
+            # Aplicar smooth_method para grupos condicionales
+            if smooth_method == "last":
+                qs_promo = qs_promo_vals.iloc[-1] if len(qs_promo_vals) > 0 else qs_calib.mean()
+                qs_no_promo = qs_no_promo_vals.iloc[-1] if len(qs_no_promo_vals) > 0 else qs_calib.mean()
+
+            elif smooth_method == "kalman":
+                qs_promo = kalman_filter(
+                    observations=qs_promo_vals,
+                    initial_state=qs_promo_vals.iloc[0] if len(qs_promo_vals) > 0 else qs_calib.mean(),
+                    process_variance=0.1,
+                    measurement_variance=0.2
+                )[-1] if len(qs_promo_vals) > 0 else qs_calib.mean()
+
+                qs_no_promo = kalman_filter(
+                    observations=qs_no_promo_vals,
+                    initial_state=qs_no_promo_vals.iloc[0] if len(qs_no_promo_vals) > 0 else qs_calib.mean(),
+                    process_variance=0.1,
+                    measurement_variance=0.2
+                )[-1] if len(qs_no_promo_vals) > 0 else qs_calib.mean()
+
+            elif smooth_method == "volatil_weighted":
+                qs_promo = volatility_weighted_average(qs_promo_vals) if len(qs_promo_vals) > 0 else qs_calib.mean()
+                qs_no_promo = volatility_weighted_average(qs_no_promo_vals) if len(qs_no_promo_vals) > 0 else qs_calib.mean()
+
+            else:
+                raise ValueError(f"Método de suavización '{smooth_method}' no soportado.")
+        else:
+            qs_promo = qs_no_promo = qs_calib.mean()
 
         # ==============================
-        # Datos de Calibración y Prueba
+        # Calibración y Prueba con Cuantiles Condicionales
         # ==============================
-        
+        if 'X' not in calib.columns:
+            calib.loc['X'] = 0
+        if 'X' not in test.columns:
+            test.loc['X'] = 0
 
-        # qs_smooth = kalman_filter(observations=qs_calib, initial_state=qs_calib[0], process_variance=0.1, measurement_variance=0.2)[-1]
-        # qs_smooth = qs_calib[-1]        
-        # qs_smooth = volatility_weighted_average(qs_calib)
+        calib.loc[:, lower_col] = calib[pred_col] - np.where(calib["X"] == 1, qs_promo, qs_no_promo)
+        calib.loc[:, upper_col] = calib[pred_col] + np.where(calib["X"] == 1, qs_promo, qs_no_promo)
+        test.loc[:, lower_col] = test[pred_col] - np.where(test["X"] == 1, qs_promo, qs_no_promo)
+        test.loc[:, upper_col] = test[pred_col] + np.where(test["X"] == 1, qs_promo, qs_no_promo)
 
-
-
-        if smooth_method == "last":
-            # Usar el último cuantil
-            qs_smooth = qs_calib[-1]
-        
-        elif smooth_method == "kalman":
-            # Filtro de Kalman
-            qs_smooth = kalman_filter(
-                observations=qs_calib,
-                initial_state=qs_calib[0],
-                process_variance=0.1,
-                measurement_variance= 0.2 
-            )[-1]
-        
-        elif smooth_method == "volatil_weighted":
-            qs_smooth = volatility_weighted_average(qs_calib)
-
-
-        # Calibración
-        calib.loc[:,lower_col] = calib[pred_col] - qs_smooth  
-        calib.loc[:,upper_col] = calib[pred_col] + qs_smooth 
-        # Prueba
-        test.loc[:,lower_col] = test[pred_col] - qs_smooth 
-        test.loc[:,upper_col] = test[pred_col] + qs_smooth 
-
-        # Agregar los conjuntos procesados a la lista de resultados
+        # Agregar resultados procesados
         results.append(pd.concat([train, calib, test]))
 
-    # Combinar los resultados procesados para todas las series
+    # Combinar resultados y retornar
     return pd.concat(results), all_logs
 
 # =========================
@@ -804,8 +897,6 @@ def plot_logs(logs):
         plt.ylabel("Cobertura")
         plt.show()
 
-
-
 def plot_heatmap(logs, component):
     all_series = []
     max_length = max(len(series_logs[component]) for series_logs in logs.values())
@@ -823,26 +914,24 @@ def plot_heatmap(logs, component):
     plt.ylabel("Series")
     plt.show()
 
-
 def aggregate_logs_average(logs):
     aggregated_logs = {
         "proportional": [],
         "integral": [],
         "derivative": [],
-        "coverage": []
+        "coverage": [],
+        "band_width": [],
+        "band_shift": [],
+        "cumulative_coverage": [],
+        "band_asymmetry": []
     }
     max_length = max(len(series_logs["proportional"]) for series_logs in logs.values())
     
     for t in range(max_length):
-        proportional_vals = [series_logs["proportional"][t] for series_logs in logs.values() if t < len(series_logs["proportional"])]
-        integral_vals = [series_logs["integral"][t] for series_logs in logs.values() if t < len(series_logs["integral"])]
-        derivative_vals = [series_logs["derivative"][t] for series_logs in logs.values() if t < len(series_logs["derivative"])]
-        coverage_vals = [series_logs["coverage"][t] for series_logs in logs.values() if t < len(series_logs["coverage"])]
-        
-        aggregated_logs["proportional"].append(np.mean(proportional_vals))
-        aggregated_logs["integral"].append(np.mean(integral_vals))
-        aggregated_logs["derivative"].append(np.mean(derivative_vals))
-        aggregated_logs["coverage"].append(np.mean(coverage_vals))
+        for metric in aggregated_logs.keys():
+            metric_vals = [series_logs[metric][t] for series_logs in logs.values() if t < len(series_logs[metric])]
+            if metric_vals:
+                aggregated_logs[metric].append(np.mean(metric_vals))
     
     return aggregated_logs
 
@@ -853,30 +942,61 @@ def plot_logs_agg(logs):
     Parámetros:
     - logs (dict): Diccionario de componentes con listas de valores promedio por paso temporal.
     """
-    time_steps = range(len(next(iter(logs.values()))))  # Número de pasos temporales
+    # Determinar el número mínimo de pasos temporales
+    min_length = min(len(values) for values in logs.values() if len(values) > 0)
+    time_steps = range(min_length)
+
+    # Truncar todas las métricas a `min_length`
+    truncated_logs = {key: values[:min_length] for key, values in logs.items()}
 
     # Gráfico de Contribuciones (Proporcional, Integral, Derivativa)
     plt.figure(figsize=(12, 6))
     for component in ["proportional", "integral", "derivative"]:
-        if component in logs:  # Asegurarse de que el componente existe en los logs
-            plt.plot(time_steps, logs[component], label=component.capitalize())
+        if component in truncated_logs:  # Asegurarse de que el componente existe en los logs
+            plt.plot(time_steps, truncated_logs[component], label=component.capitalize())
     plt.legend()
     plt.title("Contribuciones Promedio de los Componentes en el Tiempo")
     plt.xlabel("Pasos Temporales")
     plt.ylabel("Valor Promedio")
+    plt.grid(True)
     plt.show()
 
     # Gráfico de Cobertura
-    if "coverage" in logs:  # Asegurarse de que la cobertura existe en los logs
+    if "coverage" in truncated_logs:  # Asegurarse de que la cobertura existe en los logs
         plt.figure(figsize=(12, 6))
-        plt.plot(time_steps, logs["coverage"], label="Cobertura")
+        plt.plot(time_steps, truncated_logs["coverage"], label="Cobertura")
+        if "cumulative_coverage" in truncated_logs:
+            plt.plot(time_steps, truncated_logs["cumulative_coverage"], label="Cobertura Acumulada")
         plt.axhline(y=0.95, color="r", linestyle="--", label="Umbral de Cobertura (95%)")
         plt.legend()
         plt.title("Cobertura Promedio en el Tiempo")
         plt.xlabel("Pasos Temporales")
         plt.ylabel("Cobertura Promedio")
+        plt.grid(True)
         plt.show()
 
+    # Gráfico de Amplitud y Desplazamiento de Bandas
+    if "band_width" in truncated_logs and "band_shift" in truncated_logs:
+        plt.figure(figsize=(12, 6))
+        plt.plot(time_steps, truncated_logs["band_width"], label="Amplitud de Banda")
+        plt.plot(time_steps, truncated_logs["band_shift"], label="Desplazamiento de Banda")
+        plt.legend()
+        plt.title("Análisis de Amplitud y Desplazamiento de Bandas")
+        plt.xlabel("Pasos Temporales")
+        plt.ylabel("Valor Promedio")
+        plt.grid(True)
+        plt.show()
+
+    # Gráfico de Asimetría de Bandas
+    if "band_asymmetry" in truncated_logs:
+        plt.figure(figsize=(12, 6))
+        plt.plot(time_steps, truncated_logs["band_asymmetry"], label="Asimetría de Banda")
+        plt.legend()
+        plt.title("Asimetría Promedio de Bandas en el Tiempo")
+        plt.xlabel("Pasos Temporales")
+        plt.ylabel("Valor Promedio")
+        plt.grid(True)
+        plt.show()
 
 def save_logs_to_csv(logs, filename="component_logs.csv"):
     """
@@ -900,9 +1020,6 @@ def load_model(filename):
     """
     with open(filename, 'rb') as f:
         return pickle.load(f)
-
-
-
 
 def kalman_filter(observations, initial_state, process_variance, measurement_variance):
     """
@@ -936,7 +1053,6 @@ def kalman_filter(observations, initial_state, process_variance, measurement_var
         P[t] = (1 - K) * P_pred
 
     return x
-
 
 def volatility_weighted_average(qs):
     """
